@@ -17,60 +17,38 @@ from opensymbolicai.core import decomposition, primitive
 from opensymbolicai.llm import LLM, LLMConfig
 from opensymbolicai.models import DesignExecuteConfig
 
-from travelplanner_bench.models import GatheredData, TravelPlannerTask
+from travelplanner_bench.constants import (
+    ACCOMMODATION,
+    ATTRACTION,
+    BREAKFAST,
+    CURRENT_CITY,
+    DINNER,
+    FLIGHT,
+    LUNCH,
+    MEAL_KEYS,
+    NO_DATA,
+    SELF_DRIVING,
+    TAXI,
+    TRANSPORTATION,
+)
+from travelplanner_bench.models import (
+    Accommodation,
+    Attraction,
+    DistanceInfo,
+    Flight,
+    GatheredData,
+    Restaurant,
+    TransportPlan,
+    TravelPlannerTask,
+    ValidTransport,
+)
+from travelplanner_bench.utils import parse_cost
 
 log = logging.getLogger(__name__)
 
 
-def _parse_cost(val: str | Any) -> float:
-    """Parse a cost value from various formats."""
-    if isinstance(val, (int, float)):
-        return float(val)
-    if not isinstance(val, str):
-        return 0.0
-    val = val.strip().replace("$", "").replace(",", "")
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def _normalize_costs(d: dict[str, Any], cost_keys: list[str]) -> dict[str, Any]:
-    """Return a shallow copy of dict with specified cost fields parsed to floats."""
-    result = dict(d)
-    for key in cost_keys:
-        if key in result:
-            result[key] = _parse_cost(result[key])
-    return result
-
-
 class PlanAssemblerAgent(DesignExecute):
-    """Deterministic plan assembler for travel itinerary construction.
-
-    Takes gathered data (flights, restaurants, accommodations, attractions)
-    and task constraints (budget, room type, room rule, cuisine, transportation)
-    and assembles a valid day-by-day plan using deterministic primitives.
-
-    All cost fields are PRE-PARSED to floats — you can safely do arithmetic
-    on dict values like flight["Price"] or acc["price"].
-
-    PREFERRED WORKFLOW (use compound primitives to minimize calls):
-    1. plan_transport() → selects + formats flights or driving in one call
-    2. select_accommodation() → filters by room_type/room_rule + picks optimal
-    3. prepare_meals() → selects restaurants + assigns to meal slots
-    4. pick_diverse_attractions() → picks unique attractions
-    5. total_trip_cost() + check_budget() → verify budget
-    6. Loop over days calling build_day() with meals[day_idx]
-    7. set_plan() → submit the assembled days
-
-    RULES:
-    - All entity names MUST come from the gathered data variables
-    - Use compound primitives (plan_transport, select_accommodation,
-      prepare_meals) instead of lower-level calls when possible
-    - NEVER manually assign restaurants to meal slots — use prepare_meals()
-    - Always call check_budget() before set_plan()
-    - For multi-city trips, loop over cities and allocate days per city
-    """
+    """Deterministic plan assembler using filtering, optimization, and cost primitives."""
 
     def __init__(
         self,
@@ -80,24 +58,7 @@ class PlanAssemblerAgent(DesignExecute):
         super().__init__(
             llm=llm,
             name="PlanAssemblerAgent",
-            description=(
-                "Deterministic plan assembler for travel itinerary construction. "
-                "All cost fields are PRE-PARSED to floats. Use compound primitives "
-                "to minimize calls.\n\n"
-                "WORKFLOW (compound primitives):\n"
-                "1. plan_transport(outbound, return, distances, constraint, org, dest)\n"
-                "2. select_accommodation(accs, nights, budget, room_type, room_rule)\n"
-                "3. prepare_meals(restaurants, num_days, city, required_cuisines)\n"
-                "4. pick_diverse_attractions(attractions, count)\n"
-                "5. total_trip_cost() + check_budget()\n"
-                "6. Loop: build_day() using meals[day_idx] for each day\n"
-                "7. set_plan()\n\n"
-                "RULES:\n"
-                "- Use compound primitives (plan_transport, select_accommodation, "
-                "prepare_meals) instead of lower-level calls\n"
-                "- NEVER manually assign restaurants to meal slots\n"
-                "- Always check_budget() before set_plan()"
-            ),
+            description="Deterministic plan assembler using filtering, optimization, and cost primitives.",
             config=DesignExecuteConfig(
                 max_plan_retries=max_plan_retries,
                 max_loop_iterations=50,
@@ -114,12 +75,12 @@ class PlanAssemblerAgent(DesignExecute):
 
     @primitive(read_only=True)
     def filter_by_room_type(
-        self, accommodations: list[dict], required_type: str
-    ) -> list[dict]:
+        self, accommodations: list[Accommodation], required_type: str
+    ) -> list[Accommodation]:
         """Filter accommodations by room type.
 
         Args:
-            accommodations: List of accommodation dicts.
+            accommodations: List of Accommodation objects.
             required_type: Required room type (e.g., "entire room", "private room").
                            Prefix with "not " to exclude a type (e.g., "not shared room").
 
@@ -131,7 +92,7 @@ class PlanAssemblerAgent(DesignExecute):
 
         result = []
         for acc in accommodations:
-            actual = acc.get("room type", acc.get("room_type", "")).lower().strip()
+            actual = acc.room_type.lower().strip()
             if is_negation:
                 forbidden = required_lower[4:].strip()
                 if forbidden not in actual:
@@ -143,145 +104,119 @@ class PlanAssemblerAgent(DesignExecute):
 
     @primitive(read_only=True)
     def filter_by_room_rule(
-        self, accommodations: list[dict], required_rule: str
-    ) -> list[dict]:
+        self, accommodations: list[Accommodation], required_rule: str
+    ) -> list[Accommodation]:
         """Filter accommodations by house rule.
 
         Args:
-            accommodations: List of accommodation dicts.
+            accommodations: List of Accommodation objects.
             required_rule: Required rule (e.g., "No smoking", "No pets").
 
         Returns:
             Filtered list of accommodations whose house_rules contain the required rule.
         """
         rule_lower = required_rule.lower().strip()
-        result = []
-        for acc in accommodations:
-            rules = acc.get("house_rules", "").lower()
-            if rule_lower in rules:
-                result.append(acc)
-        return result
+        return [acc for acc in accommodations if rule_lower in acc.house_rules.lower()]
 
     @primitive(read_only=True)
     def filter_by_min_nights(
-        self, accommodations: list[dict], num_nights: int
-    ) -> list[dict]:
+        self, accommodations: list[Accommodation], num_nights: int
+    ) -> list[Accommodation]:
         """Filter accommodations that allow stays of num_nights or fewer.
 
         Args:
-            accommodations: List of accommodation dicts.
+            accommodations: List of Accommodation objects.
             num_nights: Number of nights you plan to stay.
 
         Returns:
-            Accommodations where minimum_nights <= num_nights.
+            Accommodations where min_nights <= num_nights.
         """
-        result = []
-        for acc in accommodations:
-            min_nights_str = acc.get("minimum nights", acc.get("minimum_nights", "1"))
-            try:
-                min_nights = int(min_nights_str)
-            except (ValueError, TypeError):
-                min_nights = 1
-            if min_nights <= num_nights:
-                result.append(acc)
-        return result
+        return [acc for acc in accommodations if acc.min_nights <= num_nights]
 
     @primitive(read_only=True)
     def filter_by_cuisine(
-        self, restaurants: list[dict], required_cuisines: list[str]
-    ) -> list[dict]:
+        self, restaurants: list[Restaurant], required_cuisines: list[str]
+    ) -> list[Restaurant]:
         """Filter restaurants that serve at least one of the required cuisines.
 
         Args:
-            restaurants: List of restaurant dicts.
+            restaurants: List of Restaurant objects.
             required_cuisines: List of required cuisine types (e.g., ["Chinese", "Italian"]).
 
         Returns:
             Restaurants that serve at least one required cuisine.
         """
         required_lower = {c.lower().strip() for c in required_cuisines}
-        result = []
-        for rest in restaurants:
-            cuisines_str = rest.get("Cuisines", "")
-            cuisines = {c.strip().lower() for c in cuisines_str.split(",") if c.strip()}
-            if cuisines & required_lower:
-                result.append(rest)
-        return result
+        return [r for r in restaurants if r.cuisine_set() & required_lower]
 
     @primitive(read_only=True)
     def filter_valid_transport(
         self,
-        flights: list[dict],
-        distances: list[dict],
+        flights: list[Flight],
+        distances: list[DistanceInfo],
         constraint: str,
-    ) -> dict:
+    ) -> ValidTransport:
         """Determine valid transport options based on constraint.
 
         Args:
-            flights: List of available flight dicts.
-            distances: List of available distance/driving dicts.
+            flights: List of available Flight objects.
+            distances: List of available DistanceInfo objects.
             constraint: Transportation constraint (e.g., "no flight", "no self-driving", or "").
 
         Returns:
-            Dict with "flights" and "distances" keys containing valid options.
+            ValidTransport with filtered flights and distances.
         """
         constraint_lower = constraint.lower().strip() if constraint else ""
         valid_flights = flights if "no flight" not in constraint_lower else []
         valid_distances = distances if "no self-driving" not in constraint_lower else []
-        return {"flights": valid_flights, "distances": valid_distances}
+        return ValidTransport(flights=valid_flights, distances=valid_distances)
 
     # =========================================================================
     # OPTIMIZATION PRIMITIVES
     # =========================================================================
 
     @primitive(read_only=True)
-    def cheapest_flights(self, flights: list[dict], n: int = 1) -> list[dict]:
+    def cheapest_flights(self, flights: list[Flight], n: int = 1) -> list[Flight]:
         """Return the n cheapest flights sorted by price.
 
         Args:
-            flights: List of flight dicts.
+            flights: List of Flight objects.
             n: Number of cheapest flights to return.
 
         Returns:
             Up to n flights sorted by ascending price.
         """
-        sorted_flights = sorted(
-            flights, key=lambda f: _parse_cost(f.get("Price", "0"))
-        )
-        return sorted_flights[:n]
+        return sorted(flights, key=lambda f: f.price)[:n]
 
     @primitive(read_only=True)
     def cheapest_accommodations(
-        self, accommodations: list[dict], n: int = 1
-    ) -> list[dict]:
+        self, accommodations: list[Accommodation], n: int = 1
+    ) -> list[Accommodation]:
         """Return the n cheapest accommodations sorted by price.
 
         Args:
-            accommodations: List of accommodation dicts.
+            accommodations: List of Accommodation objects.
             n: Number of cheapest to return.
 
         Returns:
             Up to n accommodations sorted by ascending price per night.
         """
-        sorted_accs = sorted(
-            accommodations, key=lambda a: _parse_cost(a.get("price", "0"))
-        )
-        return sorted_accs[:n]
+        return sorted(accommodations, key=lambda a: a.price)[:n]
 
     @primitive(read_only=True)
     def cheapest_restaurant_set(
         self,
-        restaurants: list[dict],
+        restaurants: list[Restaurant],
         count: int,
         required_cuisines: list[str] | None = None,
-    ) -> list[dict]:
+    ) -> list[Restaurant]:
         """Find the cheapest set of unique restaurants, optionally covering required cuisines.
 
         First ensures all required cuisines are covered (picking the cheapest
         restaurant per cuisine), then fills remaining slots with cheapest overall.
 
         Args:
-            restaurants: List of restaurant dicts.
+            restaurants: List of Restaurant objects.
             count: Total number of unique restaurants needed.
             required_cuisines: Optional list of cuisines that must be covered.
 
@@ -289,58 +224,45 @@ class PlanAssemblerAgent(DesignExecute):
             List of up to `count` unique restaurants, cheapest first,
             covering all required cuisines if possible.
         """
-        selected: list[dict] = []
+        selected: list[Restaurant] = []
         selected_names: set[str] = set()
 
         # Phase 1: Cover required cuisines
         if required_cuisines:
             for cuisine in required_cuisines:
                 cuisine_lower = cuisine.lower().strip()
-                candidates = []
-                for r in restaurants:
-                    name = r.get("Name", "")
-                    if name in selected_names:
-                        continue
-                    cuisines_str = r.get("Cuisines", "")
-                    r_cuisines = {
-                        c.strip().lower() for c in cuisines_str.split(",") if c.strip()
-                    }
-                    if cuisine_lower in r_cuisines:
-                        candidates.append(r)
+                candidates = [
+                    r for r in restaurants
+                    if r.name not in selected_names
+                    and cuisine_lower in r.cuisine_set()
+                ]
                 if candidates:
-                    cheapest = min(
-                        candidates, key=lambda r: _parse_cost(r.get("Average Cost", "0"))
-                    )
+                    cheapest = min(candidates, key=lambda r: r.average_cost)
                     selected.append(cheapest)
-                    selected_names.add(cheapest.get("Name", ""))
+                    selected_names.add(cheapest.name)
 
         # Phase 2: Fill remaining with cheapest unselected
-        remaining = count - len(selected)
-        if remaining > 0:
-            sorted_rest = sorted(
-                restaurants, key=lambda r: _parse_cost(r.get("Average Cost", "0"))
-            )
-            for r in sorted_rest:
+        if len(selected) < count:
+            for r in sorted(restaurants, key=lambda r: r.average_cost):
                 if len(selected) >= count:
                     break
-                name = r.get("Name", "")
-                if name not in selected_names:
+                if r.name not in selected_names:
                     selected.append(r)
-                    selected_names.add(name)
+                    selected_names.add(r.name)
 
         return selected
 
     @primitive(read_only=True)
     def optimal_accommodation(
         self,
-        accommodations: list[dict],
+        accommodations: list[Accommodation],
         nights: int,
         budget_remaining: float,
-    ) -> dict | None:
+    ) -> Accommodation | None:
         """Find the cheapest accommodation that fits within remaining budget.
 
         Args:
-            accommodations: List of accommodation dicts (should be pre-filtered).
+            accommodations: List of Accommodation objects (should be pre-filtered).
             nights: Number of nights staying.
             budget_remaining: Remaining budget in dollars.
 
@@ -348,12 +270,9 @@ class PlanAssemblerAgent(DesignExecute):
             Cheapest accommodation where (price * nights) <= budget_remaining,
             or None if no valid option.
         """
-        sorted_accs = sorted(
-            accommodations, key=lambda a: _parse_cost(a.get("price", "0"))
-        )
+        sorted_accs = sorted(accommodations, key=lambda a: a.price)
         for acc in sorted_accs:
-            total = _parse_cost(acc.get("price", "0")) * nights
-            if total <= budget_remaining:
+            if acc.price * nights <= budget_remaining:
                 return acc
         # If nothing fits budget, return cheapest anyway (better than nothing)
         return sorted_accs[0] if sorted_accs else None
@@ -361,7 +280,7 @@ class PlanAssemblerAgent(DesignExecute):
     @primitive(read_only=True)
     def assign_meals(
         self,
-        restaurants: list[dict],
+        restaurants: list[Restaurant],
         num_days: int,
         city: str,
     ) -> list[dict[str, str]]:
@@ -375,7 +294,7 @@ class PlanAssemblerAgent(DesignExecute):
         guarantees the diverse restaurants constraint is satisfied.
 
         Args:
-            restaurants: List of unique restaurant dicts (from cheapest_restaurant_set).
+            restaurants: List of unique Restaurant objects (from cheapest_restaurant_set).
             num_days: Total number of days in the trip.
             city: City name for formatting.
 
@@ -387,24 +306,22 @@ class PlanAssemblerAgent(DesignExecute):
         r_idx = 0
 
         for day in range(1, num_days + 1):
-            day_meals = {"breakfast": "-", "lunch": "-", "dinner": "-"}
+            day_meals = {BREAKFAST: NO_DATA, LUNCH: NO_DATA, DINNER: NO_DATA}
 
             if day == num_days:
                 # Last day: departure, no meals
                 pass
             elif day == 1:
                 # First day: no breakfast (arrival)
-                for slot in ["lunch", "dinner"]:
+                for slot in [LUNCH, DINNER]:
                     if r_idx < len(restaurants):
-                        name = restaurants[r_idx].get("Name", "")
-                        day_meals[slot] = f"{name}, {city}"
+                        day_meals[slot] = f"{restaurants[r_idx].name}, {city}"
                         r_idx += 1
             else:
                 # Middle days: all three meals
-                for slot in ["breakfast", "lunch", "dinner"]:
+                for slot in MEAL_KEYS:
                     if r_idx < len(restaurants):
-                        name = restaurants[r_idx].get("Name", "")
-                        day_meals[slot] = f"{name}, {city}"
+                        day_meals[slot] = f"{restaurants[r_idx].name}, {city}"
                         r_idx += 1
 
             meals.append(day_meals)
@@ -413,24 +330,23 @@ class PlanAssemblerAgent(DesignExecute):
 
     @primitive(read_only=True)
     def pick_diverse_attractions(
-        self, attractions: list[dict], count: int
-    ) -> list[dict]:
+        self, attractions: list[Attraction], count: int
+    ) -> list[Attraction]:
         """Pick up to `count` unique attractions.
 
         Args:
-            attractions: List of attraction dicts.
+            attractions: List of Attraction objects.
             count: Number of unique attractions to pick.
 
         Returns:
             Up to `count` unique attractions.
         """
         seen: set[str] = set()
-        result: list[dict] = []
+        result: list[Attraction] = []
         for attr in attractions:
-            name = attr.get("Name", "")
-            if name not in seen:
+            if attr.name not in seen:
                 result.append(attr)
-                seen.add(name)
+                seen.add(attr.name)
             if len(result) >= count:
                 break
         return result
@@ -442,26 +358,26 @@ class PlanAssemblerAgent(DesignExecute):
     @primitive(read_only=True)
     def select_accommodation(
         self,
-        accommodations: list[dict],
+        accommodations: list[Accommodation],
         nights: int,
         budget: float,
         room_type: str | None = None,
         room_rule: str | None = None,
-    ) -> dict | None:
+    ) -> Accommodation | None:
         """Select the best accommodation after applying all filters.
 
         Combines room_type filtering, room_rule filtering, min_nights filtering,
         and budget-optimal selection into a single call.
 
         Args:
-            accommodations: List of accommodation dicts for a city.
+            accommodations: List of Accommodation objects for a city.
             nights: Number of nights to stay.
             budget: Total remaining budget (used to prefer affordable options).
             room_type: Required room type (e.g., "entire room") or None.
             room_rule: Required house rule (e.g., "No smoking") or None.
 
         Returns:
-            Best accommodation dict, or None if no options available.
+            Best Accommodation, or None if no options available.
         """
         filtered = list(accommodations)
         if room_type:
@@ -474,7 +390,7 @@ class PlanAssemblerAgent(DesignExecute):
     @primitive(read_only=True)
     def prepare_meals(
         self,
-        restaurants: list[dict],
+        restaurants: list[Restaurant],
         num_days: int,
         city: str,
         required_cuisines: list[str] | None = None,
@@ -488,7 +404,7 @@ class PlanAssemblerAgent(DesignExecute):
         Middle days: breakfast + lunch + dinner.
 
         Args:
-            restaurants: All available restaurant dicts for the city.
+            restaurants: All available Restaurant objects for the city.
             num_days: Total trip days (or days in this city for multi-city).
             city: City name for formatting.
             required_cuisines: Cuisine types that must be covered, or None.
@@ -513,162 +429,139 @@ class PlanAssemblerAgent(DesignExecute):
     @primitive(read_only=True)
     def plan_transport(
         self,
-        outbound_flights: list[dict],
-        return_flights: list[dict],
-        distances: list[dict] | None,
+        outbound_flights: list[Flight],
+        return_flights: list[Flight],
+        distances: list[DistanceInfo] | None,
         constraint: str,
         origin: str,
         destination: str,
-    ) -> dict[str, Any]:
+    ) -> TransportPlan:
         """Select and format transport for the trip in one call.
 
         Handles flight vs self-driving selection based on constraint, picks
         cheapest options, and returns pre-formatted transport strings.
 
         Args:
-            outbound_flights: Available outbound flight dicts.
-            return_flights: Available return flight dicts.
-            distances: Available driving/distance dicts, or None.
+            outbound_flights: Available outbound Flight objects.
+            return_flights: Available return Flight objects.
+            distances: Available DistanceInfo objects, or None.
             constraint: Transport constraint ("no flight", "no self-driving", or "").
             origin: Origin city name.
             destination: Destination city name.
 
         Returns:
-            Dict with keys:
-              - "outbound_str": formatted transport string for day 1
-              - "return_str": formatted transport string for last day
-              - "outbound_flight": flight dict if flying (for cost calc), or None
-              - "return_flight": flight dict if flying (for cost calc), or None
-              - "driving_costs": list of driving costs as floats (empty if flying)
-              - "mode": "flight" or "self-driving" or "taxi"
+            TransportPlan with formatted strings, selected flights, and costs.
         """
-        transport = self.filter_valid_transport(
+        valid = self.filter_valid_transport(
             outbound_flights, distances or [], constraint
         )
 
-        valid_flights = transport["flights"]
-        valid_distances = transport["distances"]
-
-        if valid_flights:
-            out_list = self.cheapest_flights(valid_flights, n=1)
-            # For return, filter return_flights by same constraint
-            ret_transport = self.filter_valid_transport(
+        if valid.flights:
+            out_list = self.cheapest_flights(valid.flights, n=1)
+            ret_valid = self.filter_valid_transport(
                 return_flights, [], constraint
             )
-            ret_list = self.cheapest_flights(ret_transport["flights"], n=1)
+            ret_list = self.cheapest_flights(ret_valid.flights, n=1)
 
             out_f = out_list[0] if out_list else None
             ret_f = ret_list[0] if ret_list else None
 
-            return {
-                "outbound_str": self.format_flight(out_f) if out_f else "-",
-                "return_str": self.format_flight(ret_f) if ret_f else "-",
-                "outbound_flight": out_f,
-                "return_flight": ret_f,
-                "driving_costs": [],
-                "mode": "flight",
-            }
-        elif valid_distances:
-            # Use the first distance entry (typically one per route)
-            dist = valid_distances[0] if isinstance(valid_distances, list) else valid_distances
-            drive_cost = _parse_cost(dist.get("cost", 0))
-            return {
-                "outbound_str": self.format_driving(dist, origin, destination),
-                "return_str": self.format_driving(dist, destination, origin),
-                "outbound_flight": None,
-                "return_flight": None,
-                "driving_costs": [drive_cost, drive_cost],  # out + return
-                "mode": dist.get("mode", "self-driving"),
-            }
+            return TransportPlan(
+                outbound_str=self.format_flight(out_f) if out_f else "-",
+                return_str=self.format_flight(ret_f) if ret_f else "-",
+                outbound_flight=out_f,
+                return_flight=ret_f,
+                mode=FLIGHT,
+            )
+        elif valid.distances:
+            dist = valid.distances[0] if isinstance(valid.distances, list) else valid.distances
+            return TransportPlan(
+                outbound_str=self.format_driving(dist, origin, destination),
+                return_str=self.format_driving(dist, destination, origin),
+                driving_costs=[dist.cost, dist.cost],
+                mode=dist.mode,
+            )
         else:
-            return {
-                "outbound_str": "-",
-                "return_str": "-",
-                "outbound_flight": None,
-                "return_flight": None,
-                "driving_costs": [],
-                "mode": "unknown",
-            }
+            return TransportPlan(mode="unknown")
 
     # =========================================================================
     # COST CALCULATION PRIMITIVES
     # =========================================================================
 
     @primitive(read_only=True)
-    def get_cost(self, entity: dict) -> float:
-        """Get the numeric cost from any travel entity dict.
-
-        Automatically detects the cost field based on entity type:
-        - Flights: "Price"
-        - Restaurants: "Average Cost"
-        - Accommodations: "price"
-        - Distances: "cost"
+    def get_cost(self, entity: Flight | Restaurant | Accommodation | DistanceInfo) -> float:
+        """Get the numeric cost from any travel entity.
 
         Args:
-            entity: Any travel data dict (flight, restaurant, accommodation, distance).
+            entity: Any travel entity (Flight, Restaurant, Accommodation, DistanceInfo).
 
         Returns:
             Cost as a float. Returns 0.0 if no cost field found.
         """
-        for key in ("Price", "Average Cost", "price", "cost"):
-            if key in entity:
-                return _parse_cost(entity[key])
+        if isinstance(entity, Flight):
+            return entity.price
+        if isinstance(entity, Restaurant):
+            return entity.average_cost
+        if isinstance(entity, Accommodation):
+            return entity.price
+        if isinstance(entity, DistanceInfo):
+            return entity.cost
         return 0.0
 
     @primitive(read_only=True)
-    def flight_cost(self, flight: dict) -> float:
+    def flight_cost(self, flight: Flight) -> float:
         """Get the per-person cost of a flight.
 
         Args:
-            flight: A single flight dict.
+            flight: A Flight object.
 
         Returns:
             Price as a float.
         """
-        return _parse_cost(flight.get("Price", "0"))
+        return flight.price
 
     @primitive(read_only=True)
-    def accommodation_cost(self, accommodation: dict, nights: int) -> float:
+    def accommodation_cost(self, accommodation: Accommodation, nights: int) -> float:
         """Get the total cost of an accommodation for given nights.
 
         Args:
-            accommodation: A single accommodation dict.
+            accommodation: An Accommodation object.
             nights: Number of nights staying.
 
         Returns:
             Total cost (price per night * nights).
         """
-        return _parse_cost(accommodation.get("price", "0")) * nights
+        return accommodation.price * nights
 
     @primitive(read_only=True)
-    def restaurant_cost(self, restaurant: dict) -> float:
+    def restaurant_cost(self, restaurant: Restaurant) -> float:
         """Get the per-person average cost of a restaurant.
 
         Args:
-            restaurant: A single restaurant dict.
+            restaurant: A Restaurant object.
 
         Returns:
             Average cost as a float.
         """
-        return _parse_cost(restaurant.get("Average Cost", "0"))
+        return restaurant.average_cost
 
     @primitive(read_only=True)
     def total_trip_cost(
         self,
-        flights: list[dict],
-        accommodations: list[dict],
+        flights: list[Flight],
+        accommodations: list[Accommodation],
         accommodation_nights: list[int],
-        restaurants: list[dict],
+        restaurants: list[Restaurant],
         people: int,
         driving_costs: list[float] | None = None,
     ) -> float:
         """Calculate total trip cost across all components.
 
         Args:
-            flights: List of flight dicts used in the trip.
-            accommodations: List of accommodation dicts used (one per city).
+            flights: List of Flight objects used in the trip.
+            accommodations: List of Accommodation objects used (one per city).
             accommodation_nights: Number of nights at each accommodation.
-            restaurants: List of restaurant dicts used for meals.
+            restaurants: List of Restaurant objects used for meals.
             people: Number of travelers.
             driving_costs: Optional list of driving/taxi costs.
 
@@ -679,15 +572,15 @@ class PlanAssemblerAgent(DesignExecute):
 
         # Flights: per person
         for f in flights:
-            total += _parse_cost(f.get("Price", "0")) * people
+            total += f.price * people
 
         # Accommodations: per night (not per person)
         for acc, nights in zip(accommodations, accommodation_nights):
-            total += _parse_cost(acc.get("price", "0")) * nights
+            total += acc.price * nights
 
         # Restaurants: per person
         for r in restaurants:
-            total += _parse_cost(r.get("Average Cost", "0")) * people
+            total += r.average_cost * people
 
         # Driving costs
         if driving_costs:
@@ -727,67 +620,57 @@ class PlanAssemblerAgent(DesignExecute):
     # =========================================================================
 
     @primitive(read_only=True)
-    def format_flight(self, flight: dict) -> str:
-        """Format a flight dict into the standard transport string.
+    def format_flight(self, flight: Flight) -> str:
+        """Format a Flight into the standard transport string.
 
         Args:
-            flight: A flight dict with Flight Number, OriginCityName, etc.
+            flight: A Flight object.
 
         Returns:
             Formatted string like "Flight Number: F123, from X to Y, Departure Time: ..., Arrival Time: ..."
         """
-        fn = flight.get("Flight Number", "")
-        origin = flight.get("OriginCityName", "")
-        dest = flight.get("DestCityName", "")
-        dep = flight.get("DepTime", "")
-        arr = flight.get("ArrTime", "")
         return (
-            f"Flight Number: {fn}, from {origin} to {dest}, "
-            f"Departure Time: {dep}, Arrival Time: {arr}"
+            f"Flight Number: {flight.flight_number}, from {flight.origin} to {flight.destination}, "
+            f"Departure Time: {flight.dep_time}, Arrival Time: {flight.arr_time}"
         )
 
     @primitive(read_only=True)
-    def format_driving(self, distance_info: dict, origin: str, destination: str) -> str:
+    def format_driving(self, distance_info: DistanceInfo, origin: str, destination: str) -> str:
         """Format driving info into transport string.
 
         Args:
-            distance_info: Dict with duration, distance, cost fields.
+            distance_info: A DistanceInfo object.
             origin: Origin city name.
             destination: Destination city name.
 
         Returns:
             Formatted string like "Self-driving, from X to Y, Duration: ..., Distance: ..., Cost: ..."
         """
-        duration = distance_info.get("duration", "")
-        distance = distance_info.get("distance", "")
-        cost = distance_info.get("cost", "")
-        mode = distance_info.get("mode", "self-driving")
-        mode_label = "Self-driving" if "self" in mode.lower() else "Taxi"
+        mode_label = "Self-driving" if "self" in distance_info.mode.lower() else "Taxi"
         return (
             f"{mode_label}, from {origin} to {destination}, "
-            f"Duration: {duration}, Distance: {distance}, Cost: {cost}"
+            f"Duration: {distance_info.duration}, Distance: {distance_info.distance}, Cost: {distance_info.cost}"
         )
 
     @primitive(read_only=True)
-    def format_restaurant(self, restaurant: dict, city: str) -> str:
+    def format_restaurant(self, restaurant: Restaurant, city: str) -> str:
         """Format a restaurant for plan output.
 
         Args:
-            restaurant: Restaurant dict with Name field.
+            restaurant: A Restaurant object.
             city: City name.
 
         Returns:
             Formatted string like "Restaurant Name, City".
         """
-        name = restaurant.get("Name", "")
-        return f"{name}, {city}"
+        return f"{restaurant.name}, {city}"
 
     @primitive(read_only=True)
-    def format_attractions(self, attractions: list[dict], city: str) -> str:
+    def format_attractions(self, attractions: list[Attraction], city: str) -> str:
         """Format attractions for plan output (semicolon-separated).
 
         Args:
-            attractions: List of attraction dicts.
+            attractions: List of Attraction objects.
             city: City name.
 
         Returns:
@@ -795,22 +678,20 @@ class PlanAssemblerAgent(DesignExecute):
         """
         if not attractions:
             return "-"
-        parts = [f"{a.get('Name', '')}, {city}" for a in attractions]
-        return ";".join(parts)
+        return ";".join(f"{a.name}, {city}" for a in attractions)
 
     @primitive(read_only=True)
-    def format_accommodation(self, accommodation: dict, city: str) -> str:
+    def format_accommodation(self, accommodation: Accommodation, city: str) -> str:
         """Format an accommodation for plan output.
 
         Args:
-            accommodation: Accommodation dict with NAME field.
+            accommodation: An Accommodation object.
             city: City name.
 
         Returns:
             Formatted string like "Accommodation Name, City".
         """
-        name = accommodation.get("NAME", accommodation.get("Name", ""))
-        return f"{name}, {city}"
+        return f"{accommodation.name}, {city}"
 
     @primitive(read_only=False)
     def build_day(
@@ -841,13 +722,13 @@ class PlanAssemblerAgent(DesignExecute):
         """
         return {
             "days": day_num,
-            "current_city": current_city,
-            "transportation": transportation,
-            "breakfast": breakfast,
-            "attraction": attraction,
-            "lunch": lunch,
-            "dinner": dinner,
-            "accommodation": accommodation,
+            CURRENT_CITY: current_city,
+            TRANSPORTATION: transportation,
+            BREAKFAST: breakfast,
+            ATTRACTION: attraction,
+            LUNCH: lunch,
+            DINNER: dinner,
+            ACCOMMODATION: accommodation,
         }
 
     @primitive(read_only=False)
@@ -896,31 +777,31 @@ class PlanAssemblerAgent(DesignExecute):
         day_attractions = self.pick_diverse_attractions(attractions, 4)
 
         # Budget check (costs are pre-parsed floats, safe to use directly)
-        flights_used = [f for f in [transport["outbound_flight"], transport["return_flight"]] if f]
+        flights_used = [f for f in [transport.outbound_flight, transport.return_flight] if f]
         cost = self.total_trip_cost(
             flights_used, [best_acc], [2], restaurants[:5], 1,
-            driving_costs=transport["driving_costs"],
+            driving_costs=transport.driving_costs,
         )
         ok = self.check_budget(cost, 1900.0)
 
         # Build days
         acc_str = self.format_accommodation(best_acc, "Chicago")
         day1 = self.build_day(
-            1, "from Sarasota to Chicago", transport["outbound_str"],
-            meals[0]["breakfast"],
+            1, "from Sarasota to Chicago", transport.outbound_str,
+            meals[0][BREAKFAST],
             self.format_attractions(day_attractions[:2], "Chicago"),
-            meals[0]["lunch"], meals[0]["dinner"], acc_str,
+            meals[0][LUNCH], meals[0][DINNER], acc_str,
         )
         day2 = self.build_day(
             2, "Chicago", "-",
-            meals[1]["breakfast"],
+            meals[1][BREAKFAST],
             self.format_attractions(day_attractions[2:4], "Chicago"),
-            meals[1]["lunch"], meals[1]["dinner"], acc_str,
+            meals[1][LUNCH], meals[1][DINNER], acc_str,
         )
         day3 = self.build_day(
-            3, "from Chicago to Sarasota", transport["return_str"],
-            meals[2]["breakfast"], "-",
-            meals[2]["lunch"], meals[2]["dinner"], "-",
+            3, "from Chicago to Sarasota", transport.return_str,
+            meals[2][BREAKFAST], "-",
+            meals[2][LUNCH], meals[2][DINNER], "-",
         )
 
         result = self.set_plan([day1, day2, day3])
@@ -960,32 +841,85 @@ class PlanAssemblerAgent(DesignExecute):
         attrs = self.pick_diverse_attractions(attractions, 4)
 
         # Budget check
-        flights_used = [f for f in [transport["outbound_flight"], transport["return_flight"]] if f]
+        flights_used = [f for f in [transport.outbound_flight, transport.return_flight] if f]
         cost = self.total_trip_cost(
             flights_used, [best_acc], [2],
             restaurants[:5], 2,
-            driving_costs=transport["driving_costs"],
+            driving_costs=transport.driving_costs,
         )
         ok = self.check_budget(cost, 1200.0)
 
         # Build days
         acc_str = self.format_accommodation(best_acc, "CityName")
         day1 = self.build_day(
-            1, "from Origin to CityName", transport["outbound_str"],
-            meals[0]["breakfast"],
+            1, "from Origin to CityName", transport.outbound_str,
+            meals[0][BREAKFAST],
             self.format_attractions(attrs[:2], "CityName"),
-            meals[0]["lunch"], meals[0]["dinner"], acc_str,
+            meals[0][LUNCH], meals[0][DINNER], acc_str,
         )
         day2 = self.build_day(
             2, "CityName", "-",
-            meals[1]["breakfast"],
+            meals[1][BREAKFAST],
             self.format_attractions(attrs[2:4], "CityName"),
-            meals[1]["lunch"], meals[1]["dinner"], acc_str,
+            meals[1][LUNCH], meals[1][DINNER], acc_str,
         )
         day3 = self.build_day(
-            3, "from CityName to Origin", transport["return_str"],
-            meals[2]["breakfast"], "-",
-            meals[2]["lunch"], meals[2]["dinner"], "-",
+            3, "from CityName to Origin", transport.return_str,
+            meals[2][BREAKFAST], "-",
+            meals[2][LUNCH], meals[2][DINNER], "-",
+        )
+        result = self.set_plan([day1, day2, day3])
+        return result
+
+    @decomposition(
+        intent=(
+            "Build a 3-day trip with tight budget $1100, "
+            "no special room/cuisine constraints, 2 people, "
+            "flights are expensive so self-driving is cheaper"
+        ),
+        expanded_intent=(
+            "Tight budget: compare flight cost vs self-driving cost. "
+            "Use self-driving if cheaper. Pick cheapest restaurants. "
+            "NEVER raise on budget — always call set_plan(). "
+            "Post-processing handles budget optimization (swapping flights "
+            "to self-driving, trimming expensive meals)."
+        ),
+    )
+    def _ex_tight_budget_3day(self) -> str:
+        # Compare transport options: flights vs self-driving
+        transport = self.plan_transport(
+            outbound_flights, return_flights, distances, "",
+            "Origin", "CityName",
+        )
+
+        # Accommodation: cheapest option
+        best_acc = self.select_accommodation(accommodations, 2, 1100.0)
+
+        # Meals: cheapest restaurants
+        meals = self.prepare_meals(restaurants, 3, "CityName")
+
+        # Attractions
+        attrs = self.pick_diverse_attractions(attractions, 4)
+
+        # Build plan — always submit, never raise on budget.
+        # Post-processing will swap flights to self-driving and trim meals if needed.
+        acc_str = self.format_accommodation(best_acc, "CityName")
+        day1 = self.build_day(
+            1, "from Origin to CityName", transport.outbound_str,
+            meals[0][BREAKFAST],
+            self.format_attractions(attrs[:2], "CityName"),
+            meals[0][LUNCH], meals[0][DINNER], acc_str,
+        )
+        day2 = self.build_day(
+            2, "CityName", "-",
+            meals[1][BREAKFAST],
+            self.format_attractions(attrs[2:4], "CityName"),
+            meals[1][LUNCH], meals[1][DINNER], acc_str,
+        )
+        day3 = self.build_day(
+            3, "from CityName to Origin", transport.return_str,
+            meals[2][BREAKFAST], "-",
+            meals[2][LUNCH], meals[2][DINNER], "-",
         )
         result = self.set_plan([day1, day2, day3])
         return result
@@ -1001,6 +935,10 @@ class PlanAssemblerAgent(DesignExecute):
             "Use per-city restaurant/accommodation/attraction variables. "
             "prepare_meals per city, select_accommodation per city. "
             "Day 1 = arrival at city1, Day N = return from city2. "
+            "IMPORTANT: prepare_meals num_days = days_in_city + 1 (treat the "
+            "inter-city transfer day as the departure day for that city). "
+            "For a 5-day/2-city trip: city1 gets num_days=3 (arrival+stay+depart), "
+            "city2 gets num_days=3 (arrival+stay+depart). "
             "Every day must have meals (breakfast, lunch, dinner) and accommodation "
             "(except last day which may skip accommodation)."
         ),
@@ -1019,13 +957,13 @@ class PlanAssemblerAgent(DesignExecute):
         ret_f = ret_sorted[0] if ret_sorted else None
         ret_str = self.format_flight(ret_f) if ret_f else "-"
 
-        # --- City 1: San Antonio (2 nights) ---
+        # --- City 1: San Antonio (2 nights, num_days=3: arrival+stay+transfer) ---
         acc1 = self.select_accommodation(san_antonio_accommodations, 2, 3100.0)
-        meals1 = self.prepare_meals(san_antonio_restaurants, 2, "San Antonio")
+        meals1 = self.prepare_meals(san_antonio_restaurants, 3, "San Antonio")
         attrs1 = self.pick_diverse_attractions(san_antonio_attractions, 4)
         acc1_str = self.format_accommodation(acc1, "San Antonio")
 
-        # --- City 2: Houston (2 nights) ---
+        # --- City 2: Houston (2 nights, num_days=3: arrival+stay+depart) ---
         acc2 = self.select_accommodation(houston_accommodations, 2, 3100.0)
         meals2 = self.prepare_meals(houston_restaurants, 3, "Houston")
         attrs2 = self.pick_diverse_attractions(houston_attractions, 4)
@@ -1034,35 +972,143 @@ class PlanAssemblerAgent(DesignExecute):
         # --- Build all 5 days ---
         day1 = self.build_day(
             1, "from Orlando to San Antonio", out_str,
-            meals1[0]["breakfast"],
+            meals1[0][BREAKFAST],
             self.format_attractions(attrs1[:2], "San Antonio"),
-            meals1[0]["lunch"], meals1[0]["dinner"], acc1_str,
+            meals1[0][LUNCH], meals1[0][DINNER], acc1_str,
         )
         day2 = self.build_day(
             2, "San Antonio", "-",
-            meals1[1]["breakfast"],
+            meals1[1][BREAKFAST],
             self.format_attractions(attrs1[2:4], "San Antonio"),
-            meals1[1]["lunch"], meals1[1]["dinner"], acc1_str,
+            meals1[1][LUNCH], meals1[1][DINNER], acc1_str,
         )
         day3 = self.build_day(
             3, "from San Antonio to Houston", inter_str,
-            meals2[0]["breakfast"],
+            meals2[0][BREAKFAST],
             self.format_attractions(attrs2[:2], "Houston"),
-            meals2[0]["lunch"], meals2[0]["dinner"], acc2_str,
+            meals2[0][LUNCH], meals2[0][DINNER], acc2_str,
         )
         day4 = self.build_day(
             4, "Houston", "-",
-            meals2[1]["breakfast"],
+            meals2[1][BREAKFAST],
             self.format_attractions(attrs2[2:4], "Houston"),
-            meals2[1]["lunch"], meals2[1]["dinner"], acc2_str,
+            meals2[1][LUNCH], meals2[1][DINNER], acc2_str,
         )
         day5 = self.build_day(
             5, "from Houston to Orlando", ret_str,
-            meals2[2]["breakfast"], "-",
-            meals2[2]["lunch"], meals2[2]["dinner"], "-",
+            meals2[2][BREAKFAST], "-",
+            meals2[2][LUNCH], meals2[2][DINNER], "-",
         )
 
         result = self.set_plan([day1, day2, day3, day4, day5])
+        return result
+
+    @decomposition(
+        intent=(
+            "Build a 7-day multi-city trip plan visiting 3 cities: "
+            "Denver -> Pellston (2 days) -> Kalamazoo (2 days) -> Detroit (2 days) -> Denver, "
+            "budget $5000, 2 people, room type 'private room'"
+        ),
+        expanded_intent=(
+            "3-city multi-city: handle 4 transport legs. Use leg1_flights..leg4_flights "
+            "or numbered flight variables. When no flights available for a leg, fall back "
+            "to self-driving using distances. Each city gets arrival + stay + departure days. "
+            "CRITICAL: never raise on budget — always call set_plan(). Post-processing "
+            "handles budget optimization (swapping flights to self-driving, trimming meals)."
+        ),
+    )
+    def _ex_multi_city_3cities_7day(self) -> str:
+        # --- Transport legs (4 legs for 3 cities) ---
+        # Leg 1: Denver -> Pellston
+        leg1 = cheapest_flights(leg1_flights, n=1)
+        leg1_f = leg1[0] if leg1 else None
+        leg1_str = self.format_flight(leg1_f) if leg1_f else "-"
+
+        # Leg 2: Pellston -> Kalamazoo
+        leg2 = cheapest_flights(leg2_flights, n=1)
+        leg2_f = leg2[0] if leg2 else None
+        leg2_str = self.format_flight(leg2_f) if leg2_f else "-"
+
+        # Leg 3: Kalamazoo -> Detroit
+        leg3 = cheapest_flights(leg3_flights, n=1)
+        leg3_f = leg3[0] if leg3 else None
+        leg3_str = self.format_flight(leg3_f) if leg3_f else "-"
+
+        # Leg 4: Detroit -> Denver (return)
+        leg4 = cheapest_flights(leg4_flights, n=1)
+        leg4_f = leg4[0] if leg4 else None
+        leg4_str = self.format_flight(leg4_f) if leg4_f else "-"
+
+        # --- City 1: Pellston (2 nights, num_days=3: arrival+stay+depart) ---
+        acc1 = self.select_accommodation(
+            pellston_accommodations, 2, 5000.0, room_type="private room"
+        )
+        meals1 = self.prepare_meals(pellston_restaurants, 3, "Pellston")
+        attrs1 = self.pick_diverse_attractions(pellston_attractions, 4)
+        acc1_str = self.format_accommodation(acc1, "Pellston")
+
+        # --- City 2: Kalamazoo (2 nights, num_days=3: arrival+stay+depart) ---
+        acc2 = self.select_accommodation(
+            kalamazoo_accommodations, 2, 5000.0, room_type="private room"
+        )
+        meals2 = self.prepare_meals(kalamazoo_restaurants, 3, "Kalamazoo")
+        attrs2 = self.pick_diverse_attractions(kalamazoo_attractions, 4)
+        acc2_str = self.format_accommodation(acc2, "Kalamazoo")
+
+        # --- City 3: Detroit (2 nights, num_days=3: arrival+stay+depart) ---
+        acc3 = self.select_accommodation(
+            detroit_accommodations, 2, 5000.0, room_type="private room"
+        )
+        meals3 = self.prepare_meals(detroit_restaurants, 3, "Detroit")
+        attrs3 = self.pick_diverse_attractions(detroit_attractions, 4)
+        acc3_str = self.format_accommodation(acc3, "Detroit")
+
+        # --- Build all 7 days ---
+        day1 = self.build_day(
+            1, "from Denver to Pellston", leg1_str,
+            meals1[0][BREAKFAST],
+            self.format_attractions(attrs1[:2], "Pellston"),
+            meals1[0][LUNCH], meals1[0][DINNER], acc1_str,
+        )
+        day2 = self.build_day(
+            2, "Pellston", "-",
+            meals1[1][BREAKFAST],
+            self.format_attractions(attrs1[2:4], "Pellston"),
+            meals1[1][LUNCH], meals1[1][DINNER], acc1_str,
+        )
+        day3 = self.build_day(
+            3, "from Pellston to Kalamazoo", leg2_str,
+            meals2[0][BREAKFAST],
+            self.format_attractions(attrs2[:2], "Kalamazoo"),
+            meals2[0][LUNCH], meals2[0][DINNER], acc2_str,
+        )
+        day4 = self.build_day(
+            4, "Kalamazoo", "-",
+            meals2[1][BREAKFAST],
+            self.format_attractions(attrs2[2:4], "Kalamazoo"),
+            meals2[1][LUNCH], meals2[1][DINNER], acc2_str,
+        )
+        day5 = self.build_day(
+            5, "from Kalamazoo to Detroit", leg3_str,
+            meals3[0][BREAKFAST],
+            self.format_attractions(attrs3[:2], "Detroit"),
+            meals3[0][LUNCH], meals3[0][DINNER], acc3_str,
+        )
+        day6 = self.build_day(
+            6, "Detroit", "-",
+            meals3[1][BREAKFAST],
+            self.format_attractions(attrs3[2:4], "Detroit"),
+            meals3[1][LUNCH], meals3[1][DINNER], acc3_str,
+        )
+        day7 = self.build_day(
+            7, "from Detroit to Denver", leg4_str,
+            meals3[2][BREAKFAST], "-",
+            meals3[2][LUNCH], meals3[2][DINNER], "-",
+        )
+
+        # Budget check — never raise, always submit.
+        # Post-processing handles budget optimization.
+        result = self.set_plan([day1, day2, day3, day4, day5, day6, day7])
         return result
 
     # =========================================================================
@@ -1109,6 +1155,7 @@ class PlanAssemblerAgent(DesignExecute):
         self._task = task
 
         result = self.run(task_str)
+        self._run_result = result  # Expose for logging
 
         if self._submitted_plan is not None:
             log.info("POST-PROC: calling _fill_missing_fields on %d-day plan", len(self._submitted_plan))
@@ -1144,16 +1191,41 @@ class PlanAssemblerAgent(DesignExecute):
         # --- Phase 2: Clear last/return day ---
         self._clear_return_day(plan, task)
 
-        # --- Phase 3: Fix meals referencing wrong city ---
+        # --- Phase 3: Fix meals and attractions referencing wrong city ---
         self._fix_wrong_city_meals(plan, gathered, task)
+        self._fix_wrong_city_attractions(plan, gathered, task)
 
         # --- Phase 4: Fill missing meals and accommodation ---
+        required_cuisine_set: set[str] = set()
+        if task.local_constraint.cuisine:
+            required_cuisine_set = {
+                c.strip().lower() for c in task.local_constraint.cuisine
+            }
+
         used_restaurants: set[str] = set()
         for day in plan:
-            for meal_key in ("breakfast", "lunch", "dinner"):
+            for meal_key in MEAL_KEYS:
                 name = day.get(meal_key, "-").strip()
                 if name and name != "-":
                     used_restaurants.add(name.split(",")[0].strip().lower())
+
+        # Determine which required cuisines are already covered by existing meals
+        def _covered_cuisines(p: list[dict], g: GatheredData) -> set[str]:
+            covered: set[str] = set()
+            for d in p:
+                for mk in MEAL_KEYS:
+                    v = d.get(mk, "-").strip()
+                    if not v or v == "-":
+                        continue
+                    base = v.rsplit(",", 1)[0].strip()
+                    for city_rests in g.restaurants.values():
+                        for r in city_rests:
+                            if r.name.strip().lower() == base.lower():
+                                covered |= r.cuisine_set()
+            return covered
+
+        covered = _covered_cuisines(plan, gathered)
+        uncovered = required_cuisine_set - covered
 
         for day in plan:
             day_num = day.get("days", 0)
@@ -1164,119 +1236,555 @@ class PlanAssemblerAgent(DesignExecute):
             city_restaurants = self._find_city_data(gathered.restaurants, city)
             city_accs = self._find_city_data(gathered.accommodations, city)
 
-            # Fill missing meals
-            for meal_key in ("breakfast", "lunch", "dinner"):
+            # Fill missing meals — prefer restaurants covering uncovered cuisines
+            # Skip Day 1 breakfast: arrival-day convention (prepare_meals leaves
+            # it empty, agent's budget doesn't include it, and
+            # check_complete_info only requires filled >= 2 on day 1).
+            for meal_key in MEAL_KEYS:
+                if day_num == 1 and meal_key == BREAKFAST:
+                    continue
                 val = day.get(meal_key, "-").strip()
                 if not val or val == "-":
                     rest = self._pick_unused_restaurant(
-                        city_restaurants, used_restaurants
+                        city_restaurants,
+                        used_restaurants,
+                        preferred_cuisines=uncovered if uncovered else None,
                     )
                     if rest:
-                        name = rest.get("Name", "").strip()
-                        day[meal_key] = f"{name}, {city}"
-                        used_restaurants.add(name.lower())
+                        day[meal_key] = f"{rest.name}, {city}"
+                        used_restaurants.add(rest.name.lower())
+                        # Update uncovered set
+                        if uncovered:
+                            uncovered -= rest.cuisine_set()
 
             # Fill missing accommodation (skip last day)
             if day_num != task.days:
-                val = day.get("accommodation", "-").strip()
+                val = day.get(ACCOMMODATION, NO_DATA).strip()
                 if (not val or val == "-") and city_accs:
-                    acc = min(
-                        city_accs,
-                        key=lambda a: _parse_cost(a.get("price", 9999)),
-                    )
-                    acc_name = acc.get("NAME", acc.get("Name", "")).strip()
-                    day["accommodation"] = f"{acc_name}, {city}"
+                    acc = min(city_accs, key=lambda a: a.price)
+                    day[ACCOMMODATION] = f"{acc.name}, {city}"
 
-        # --- Phase 5: Deduplicate attractions ---
+        # --- Phase 5: Cuisine coverage sweep ---
+        # If required cuisines are still uncovered after filling, swap a
+        # non-cuisine-critical restaurant with one that covers the gap.
+        if required_cuisine_set:
+            self._ensure_cuisine_coverage(plan, gathered, task, required_cuisine_set)
+
+        # --- Phase 6: Deduplicate attractions ---
         self._deduplicate_attractions(plan, gathered)
+
+        # --- Phase 7: Budget guard ---
+        # If a budget is specified, verify total cost.  When over-budget,
+        # remove the most-expensive *expendable* meals (those not solely
+        # covering a required cuisine) until within budget.
+        if task.budget:
+            self._budget_guard(plan, gathered, task, required_cuisine_set)
+
+    def _budget_guard(
+        self,
+        plan: list[dict[str, Any]],
+        gathered: GatheredData,
+        task: TravelPlannerTask,
+        required_cuisine_set: set[str],
+    ) -> None:
+        """Remove expendable meals if total plan cost exceeds the budget."""
+        import re as _re
+
+        people = task.people_number or 1
+
+        def _restaurant_cost(name: str) -> float:
+            n = name.strip().lower()
+            for rests in gathered.restaurants.values():
+                for r in rests:
+                    if r.name.strip().lower() == n:
+                        return r.average_cost
+            return 0.0
+
+        def _flight_cost(flight_number: str) -> float:
+            fn = flight_number.strip().lower()
+            for flights in gathered.flights.values():
+                for f in flights:
+                    if f.flight_number.strip().lower() == fn:
+                        return f.price
+            return 0.0
+
+        def _accommodation_cost(name: str) -> float:
+            n = name.strip().lower()
+            for accs in gathered.accommodations.values():
+                for a in accs:
+                    if a.name.strip().lower() == n:
+                        return a.price
+            return 0.0
+
+        def _total_cost() -> float:
+            total = 0.0
+            for day in plan:
+                # Flights
+                transport = day.get(TRANSPORTATION, NO_DATA)
+                if transport and transport.strip() != "-":
+                    fm = _re.search(r"Flight\s+Number:\s*([A-Za-z0-9]+)", transport)
+                    if fm:
+                        total += _flight_cost(fm.group(1)) * people
+                    else:
+                        cm = _re.search(r"[Cc]ost:?\s*\$?([\d,.]+)", transport)
+                        if cm:
+                            total += parse_cost(cm.group(1))
+                # Meals
+                for mk in MEAL_KEYS:
+                    v = day.get(mk, "-").strip()
+                    if v and v != "-":
+                        base = v.rsplit(",", 1)[0].strip()
+                        total += _restaurant_cost(base) * people
+                # Accommodation
+                acc = day.get(ACCOMMODATION, NO_DATA).strip()
+                if acc and acc != "-":
+                    base = acc.rsplit(",", 1)[0].strip()
+                    total += _accommodation_cost(base)
+            return total
+
+        cost = _total_cost()
+        if cost <= task.budget:
+            return
+
+        log.warning(
+            "BUDGET GUARD: plan cost $%.0f exceeds budget $%.0f — trimming meals",
+            cost, task.budget,
+        )
+
+        # Build set of cuisine-critical restaurant names (sole providers)
+        critical_names: set[str] = set()
+        if required_cuisine_set:
+            # cuisine → set of restaurant names covering it
+            cuisine_providers: dict[str, set[str]] = {c: set() for c in required_cuisine_set}
+            for day in plan:
+                for mk in MEAL_KEYS:
+                    v = day.get(mk, "-").strip()
+                    if not v or v == "-":
+                        continue
+                    base = v.rsplit(",", 1)[0].strip().lower()
+                    for rests in gathered.restaurants.values():
+                        for r in rests:
+                            if r.name.strip().lower() == base:
+                                for c in r.cuisines.split(","):
+                                    cl = c.strip().lower()
+                                    if cl in cuisine_providers:
+                                        cuisine_providers[cl].add(base)
+            for _cuisine, providers in cuisine_providers.items():
+                if len(providers) == 1:
+                    critical_names |= providers
+
+        # Collect removable meal slots: (cost_per_person, day_idx, meal_key)
+        removable: list[tuple[float, int, str]] = []
+        for i, day in enumerate(plan):
+            for mk in MEAL_KEYS:
+                v = day.get(mk, "-").strip()
+                if not v or v == "-":
+                    continue
+                base = v.rsplit(",", 1)[0].strip()
+                if base.lower() in critical_names:
+                    continue
+                mc = _restaurant_cost(base)
+                removable.append((mc, i, mk))
+
+        # Sort by cost descending — remove the most expensive first
+        removable.sort(key=lambda x: x[0], reverse=True)
+
+        for mc, i, mk in removable:
+            plan[i][mk] = "-"
+            cost -= mc * people
+            log.info(
+                "BUDGET GUARD: removed %s day %d (saved $%.0f) — new total $%.0f",
+                mk, plan[i].get("days", i + 1), mc * people, cost,
+            )
+            if cost <= task.budget:
+                break
+
+        # If still over budget after removing all meals, try swapping
+        # flights to self-driving (much cheaper for tight budgets).
+        if cost > task.budget:
+            self._budget_guard_swap_transport(plan, gathered, task, _re, _flight_cost, people)
+            cost = _total_cost()
+            if cost <= task.budget:
+                log.info("BUDGET GUARD: transport swap resolved budget — $%.0f", cost)
+
+        # Re-fill meals after transport swap freed up budget
+        if cost <= task.budget:
+            # Check if any non-return day has all meals empty — refill them
+            has_empty = False
+            for day in plan:
+                dn = day.get("days", 0)
+                if dn == task.days:
+                    continue  # skip return day
+                for mk in MEAL_KEYS:
+                    if dn == 1 and mk == BREAKFAST:
+                        continue
+                    v = day.get(mk, "-").strip()
+                    if not v or v == "-":
+                        has_empty = True
+                        break
+            if has_empty:
+                # Re-run Phase 4 style filling with remaining budget awareness
+                used: set[str] = set()
+                for day in plan:
+                    for mk in MEAL_KEYS:
+                        v = day.get(mk, "-").strip()
+                        if v and v != "-":
+                            used.add(v.rsplit(",", 1)[0].strip().lower())
+                for day in plan:
+                    dn = day.get("days", 0)
+                    city = self._infer_stay_city(day, task, gathered)
+                    if not city:
+                        continue
+                    city_rests = self._find_city_data(gathered.restaurants, city)
+                    for mk in MEAL_KEYS:
+                        if dn == 1 and mk == BREAKFAST:
+                            continue
+                        v = day.get(mk, "-").strip()
+                        if v and v != "-":
+                            continue
+                        rest = self._pick_unused_restaurant(city_rests, used)
+                        if rest:
+                            if cost + rest.average_cost * people <= task.budget:
+                                day[mk] = f"{rest.name}, {city}"
+                                used.add(rest.name.lower())
+                                cost += rest.average_cost * people
+
+    @staticmethod
+    def _budget_guard_swap_transport(
+        plan: list[dict[str, Any]],
+        gathered: GatheredData,
+        task: TravelPlannerTask,
+        _re: Any,
+        _flight_cost: Any,
+        people: int,
+    ) -> None:
+        """Swap flight-based transport to self-driving if cheaper."""
+        for day in plan:
+            transport = day.get(TRANSPORTATION, NO_DATA)
+            if not transport or transport.strip() == "-":
+                continue
+            fm = _re.search(r"Flight\s+Number:\s*([A-Za-z0-9]+)", transport)
+            if not fm:
+                continue
+            # This day uses a flight — check if self-driving is available
+            origin_dest = _re.search(
+                r"from\s+(.+?)\s+to\s+(.+?)(?:,|\s*$)",
+                transport,
+            )
+            if not origin_dest:
+                continue
+            orig = origin_dest.group(1).strip()
+            dest = origin_dest.group(2).strip()
+            # Find self-driving distance data
+            drive_data: DistanceInfo | None = None
+            for _key, d in gathered.distances.items():
+                if (d.origin.lower() == orig.lower()
+                        and d.destination.lower() == dest.lower()
+                        and d.mode == SELF_DRIVING):
+                    drive_data = d
+                    break
+            if not drive_data:
+                continue
+            flight_cost_val = _flight_cost(fm.group(1)) * people
+            if drive_data.cost < flight_cost_val:
+                day[TRANSPORTATION] = (
+                    f"Self-driving, from {orig} to {dest}, "
+                    f"Duration: {drive_data.duration}, Distance: {drive_data.distance} km, "
+                    f"Cost: {drive_data.cost}"
+                )
+                log.info(
+                    "BUDGET GUARD: swapped flight $%.0f → self-driving $%.0f "
+                    "for %s → %s",
+                    flight_cost_val, drive_data.cost, orig, dest,
+                )
+
+    def _ensure_cuisine_coverage(
+        self,
+        plan: list[dict[str, Any]],
+        gathered: GatheredData,
+        task: TravelPlannerTask,
+        required_cuisine_set: set[str],
+    ) -> None:
+        """Swap restaurants in the plan to guarantee all required cuisines appear.
+
+        1. Determine which required cuisines are already covered.
+        2. For each uncovered cuisine, find a candidate restaurant from any
+           city's data that serves it.
+        3. Swap it with the cheapest non-cuisine-critical meal slot (one whose
+           restaurant doesn't uniquely cover any required cuisine).
+        """
+        # Build restaurant-name → cuisines lookup from all gathered data
+        rest_cuisines: dict[str, set[str]] = {}  # lower(name) → set of lower cuisines
+        rest_city: dict[str, str] = {}  # lower(name) → city
+        rest_obj: dict[str, Restaurant] = {}  # lower(name) → Restaurant
+        for city, rests in gathered.restaurants.items():
+            for r in rests:
+                if not r.name:
+                    continue
+                key = r.name.lower()
+                rest_cuisines[key] = r.cuisine_set()
+                rest_city[key] = city
+                rest_obj[key] = r
+
+        # Identify which required cuisines each plan-meal covers
+        def _plan_covered() -> set[str]:
+            covered: set[str] = set()
+            for d in plan:
+                for mk in MEAL_KEYS:
+                    v = d.get(mk, "-").strip()
+                    if not v or v == "-":
+                        continue
+                    base = v.rsplit(",", 1)[0].strip().lower()
+                    covered |= rest_cuisines.get(base, set())
+            return covered
+
+        covered = _plan_covered()
+        uncovered = required_cuisine_set - covered
+        if not uncovered:
+            return
+
+        log.info("CUISINE_SWEEP: uncovered=%s, attempting swaps", uncovered)
+
+        # Collect current plan meal entries as (day_idx, meal_key, base_name_lower)
+        plan_meals: list[tuple[int, str, str]] = []
+        used_names: set[str] = set()
+        for i, d in enumerate(plan):
+            for mk in MEAL_KEYS:
+                v = d.get(mk, "-").strip()
+                if not v or v == "-":
+                    continue
+                base = v.rsplit(",", 1)[0].strip().lower()
+                plan_meals.append((i, mk, base))
+                used_names.add(base)
+
+        for missing_cuisine in list(uncovered):
+            # Find a candidate restaurant serving this cuisine that isn't
+            # already in the plan
+            candidate: Restaurant | None = None
+            candidate_city: str | None = None
+            for city, rests in gathered.restaurants.items():
+                sorted_rests = sorted(rests, key=lambda r: r.average_cost)
+                for r in sorted_rests:
+                    if not r.name or r.name.lower() in used_names:
+                        continue
+                    if missing_cuisine in r.cuisine_set():
+                        candidate = r
+                        candidate_city = city
+                        break
+                if candidate:
+                    break
+
+            if not candidate or not candidate_city:
+                continue
+
+            # Find the best slot to swap: prefer a meal whose restaurant
+            # doesn't uniquely cover any required cuisine. Also prefer slots
+            # in the same city as the candidate.
+            best_slot = None
+            best_score = -1
+            for i, mk, base in plan_meals:
+                r_cuisines = rest_cuisines.get(base, set())
+                # Is this restaurant the sole provider of any required cuisine?
+                sole_provider = False
+                for req_c in required_cuisine_set:
+                    if req_c in r_cuisines:
+                        # Check if any OTHER plan restaurant also covers it
+                        other_covers = False
+                        for _, _, other_base in plan_meals:
+                            if other_base == base:
+                                continue
+                            if req_c in rest_cuisines.get(other_base, set()):
+                                other_covers = True
+                                break
+                        if not other_covers:
+                            sole_provider = True
+                            break
+                if sole_provider:
+                    continue  # Don't swap out sole providers
+
+                # Score: prefer same city (2), otherwise any city (1)
+                score = 1
+                slot_city = rest_city.get(base, "")
+                if slot_city.lower() == candidate_city.lower():
+                    score = 2
+                if score > best_score:
+                    best_score = score
+                    best_slot = (i, mk, base)
+
+            if best_slot:
+                day_idx, meal_key, old_base = best_slot
+                plan[day_idx][meal_key] = f"{candidate.name}, {candidate_city}"
+                used_names.discard(old_base)
+                used_names.add(candidate.name.lower())
+                # Update plan_meals list
+                plan_meals = [
+                    (ci, cmk, candidate.name.lower()) if (ci == day_idx and cmk == meal_key)
+                    else (ci, cmk, cb)
+                    for ci, cmk, cb in plan_meals
+                ]
+                log.info(
+                    "CUISINE_SWEEP: swapped %r → %r to cover %r",
+                    old_base, candidate.name, missing_cuisine,
+                )
 
     def _fix_transport_conflicts(
         self, plan: list[dict[str, Any]], gathered: GatheredData
     ) -> None:
-        """Ensure all transport in the plan uses a single mode (flight or driving).
+        """Ensure all transport in the plan uses a single mode.
 
-        If both modes are detected, convert all transport to self-driving
-        (which is always available in the reference data).
+        Respects the transport constraint when resolving conflicts:
+        - "no self-driving": convert self-driving legs to taxi/flight
+        - "no flight": convert flight legs to self-driving/taxi
+        - Otherwise: convert flights to self-driving (cheapest ground option)
         """
+        constraint = ""
+        if hasattr(self, "_task") and self._task:
+            constraint = (self._task.local_constraint.transportation or "").lower()
+
         has_flight = False
-        has_driving = False
+        has_driving = False  # self-driving or taxi
         for day in plan:
-            trans = day.get("transportation", "-").strip()
+            trans = day.get(TRANSPORTATION, NO_DATA).strip()
             if not trans or trans == "-":
                 continue
             t_lower = trans.lower()
-            if "flight" in t_lower:
+            if FLIGHT in t_lower:
                 has_flight = True
-            if "self-driving" in t_lower or "self driving" in t_lower:
+            if SELF_DRIVING in t_lower or "self driving" in t_lower or TAXI in t_lower:
                 has_driving = True
 
         if not (has_flight and has_driving):
             return  # No conflict
 
-        # Conflict detected: convert all flights to self-driving
+        # Decide which mode to keep based on constraint
+        if f"no {SELF_DRIVING}" in constraint:
+            # Keep flights, convert self-driving to taxi
+            convert_mode = SELF_DRIVING
+            target_mode = TAXI
+        elif f"no {FLIGHT}" in constraint:
+            # Keep driving, convert flights to self-driving
+            convert_mode = FLIGHT
+            target_mode = SELF_DRIVING
+        else:
+            # Default: convert flights to self-driving
+            convert_mode = FLIGHT
+            target_mode = SELF_DRIVING
+
         for day in plan:
-            trans = day.get("transportation", "-").strip()
+            trans = day.get(TRANSPORTATION, NO_DATA).strip()
             if not trans or trans == "-":
                 continue
-            if "flight" not in trans.lower():
+            t_lower = trans.lower()
+
+            needs_convert = False
+            if convert_mode == FLIGHT and FLIGHT in t_lower:
+                needs_convert = True
+            elif convert_mode == SELF_DRIVING and (
+                SELF_DRIVING in t_lower or "self driving" in t_lower
+            ):
+                needs_convert = True
+
+            if not needs_convert:
                 continue
-            # Find a matching driving distance for this leg
-            current_city = day.get("current_city", "")
-            if "from" in current_city.lower() and "to" in current_city.lower():
-                parts = current_city.split("to")
-                if len(parts) >= 2:
-                    origin_part = parts[0].replace("from", "").strip()
-                    dest_part = parts[-1].strip()
-                    # Find matching distance
-                    for route_key, dist in gathered.distances.items():
-                        rk_lower = route_key.lower()
-                        if (
-                            origin_part.lower() in rk_lower
-                            and dest_part.lower() in rk_lower
-                            and "self-driving" in rk_lower
-                        ):
-                            day["transportation"] = self.format_driving(
-                                dist, origin_part, dest_part
-                            )
-                            break
-                    else:
-                        # No distance data; build a generic self-driving string
-                        day["transportation"] = (
-                            f"Self-driving, from {origin_part} to {dest_part}"
+
+            current_city = day.get(CURRENT_CITY, "")
+            match = re.match(r"from\s+(.+?)\s+to\s+(.+)", current_city, re.IGNORECASE)
+            if not match:
+                continue
+            origin_part = match.group(1).strip()
+            dest_part = match.group(2).strip()
+
+            # Find a matching distance for the target mode
+            replaced = False
+            for route_key, dist in gathered.distances.items():
+                rk_lower = route_key.lower()
+                if (
+                    origin_part.lower() in rk_lower
+                    and dest_part.lower() in rk_lower
+                ):
+                    if target_mode in dist.mode.lower() or (
+                        target_mode == SELF_DRIVING and "self" in dist.mode.lower()
+                    ):
+                        day[TRANSPORTATION] = self.format_driving(
+                            dist, origin_part, dest_part
                         )
+                        replaced = True
+                        break
+
+            if not replaced:
+                # Try any available distance
+                for route_key, dist in gathered.distances.items():
+                    rk_lower = route_key.lower()
+                    if (
+                        origin_part.lower() in rk_lower
+                        and dest_part.lower() in rk_lower
+                    ):
+                        day[TRANSPORTATION] = self.format_driving(
+                            dist, origin_part, dest_part
+                        )
+                        replaced = True
+                        break
+
+            if not replaced:
+                mode_label = "Taxi" if target_mode == TAXI else "Self-driving"
+                day[TRANSPORTATION] = (
+                    f"{mode_label}, from {origin_part} to {dest_part}"
+                )
 
     def _fill_missing_transport(
         self, plan: list[dict[str, Any]], gathered: GatheredData
     ) -> None:
-        """Fill missing transportation on transition days ('from X to Y')."""
+        """Fill missing transportation on transition days ('from X to Y').
+
+        Respects the transport constraint: won't use flights when "no flight",
+        won't use self-driving when "no self-driving".  Searches ALL distance
+        modes (taxi **and** self-driving) so taxi-only routes are found.
+        """
+        constraint = ""
+        if hasattr(self, "_task") and self._task:
+            constraint = (self._task.local_constraint.transportation or "").lower()
+
         for day in plan:
-            trans = day.get("transportation", "-").strip()
+            trans = day.get(TRANSPORTATION, NO_DATA).strip()
             if trans and trans != "-":
                 continue
-            current = day.get("current_city", "")
+            current = day.get(CURRENT_CITY, "")
             match = re.match(r"from\s+(.+?)\s+to\s+(.+)", current, re.IGNORECASE)
             if not match:
                 continue
             origin = match.group(1).strip()
             dest = match.group(2).strip()
-            # Try flights first
-            for fk, flights in gathered.flights.items():
-                if origin.lower() in fk.lower() and dest.lower() in fk.lower() and flights:
-                    day["transportation"] = self.format_flight(flights[0])
-                    break
-            else:
-                # Try self-driving distance
+
+            filled = False
+
+            # Try flights first (unless "no flight" constraint)
+            if "no flight" not in constraint:
+                for fk, flights in gathered.flights.items():
+                    if origin.lower() in fk.lower() and dest.lower() in fk.lower() and flights:
+                        cheapest = min(flights, key=lambda f: f.price)
+                        day[TRANSPORTATION] = self.format_flight(cheapest)
+                        filled = True
+                        break
+
+            # Try distance data (taxi and self-driving)
+            if not filled:
                 for dk, dist in gathered.distances.items():
                     dk_lower = dk.lower()
-                    if (
-                        origin.lower() in dk_lower
-                        and dest.lower() in dk_lower
-                        and "self-driving" in dk_lower
-                    ):
-                        day["transportation"] = self.format_driving(dist, origin, dest)
-                        break
+                    if origin.lower() not in dk_lower or dest.lower() not in dk_lower:
+                        continue
+                    # Respect "no self-driving" constraint
+                    if f"no {SELF_DRIVING}" in constraint and SELF_DRIVING in dist.mode.lower():
+                        continue
+                    day[TRANSPORTATION] = self.format_driving(dist, origin, dest)
+                    filled = True
+                    break
+
+            # Fallback: use mode consistent with constraint
+            if not filled:
+                if "no self-driving" in constraint:
+                    day[TRANSPORTATION] = f"Taxi, from {origin} to {dest}"
                 else:
-                    day["transportation"] = f"Self-driving, from {origin} to {dest}"
+                    day[TRANSPORTATION] = f"Self-driving, from {origin} to {dest}"
 
     @staticmethod
     def _clear_return_day(
@@ -1293,7 +1801,7 @@ class PlanAssemblerAgent(DesignExecute):
         if not plan:
             return
         last_day = plan[-1]
-        current = last_day.get("current_city", "")
+        current = last_day.get(CURRENT_CITY, "")
         # Only clear if this is a "from X to Origin" transition
         if "from" not in current.lower() or "to" not in current.lower():
             return
@@ -1306,7 +1814,7 @@ class PlanAssemblerAgent(DesignExecute):
         if dest != task.org.lower().strip():
             return
         log.info("RETURN_DAY: clearing last day fields")
-        for key in ("breakfast", "lunch", "dinner", "attraction", "accommodation"):
+        for key in (*MEAL_KEYS, ATTRACTION, ACCOMMODATION):
             last_day[key] = "-"
 
     def _fix_wrong_city_meals(
@@ -1324,13 +1832,13 @@ class PlanAssemblerAgent(DesignExecute):
         """
         used_restaurants: set[str] = set()
         for day in plan:
-            for mk in ("breakfast", "lunch", "dinner"):
+            for mk in MEAL_KEYS:
                 v = day.get(mk, "-").strip()
                 if v and v != "-":
                     used_restaurants.add(v.split(",")[0].strip().lower())
 
         for day in plan:
-            current = day.get("current_city", "")
+            current = day.get(CURRENT_CITY, "")
             if not current or current.strip() == "-":
                 continue
             # Determine the expected city
@@ -1344,7 +1852,7 @@ class PlanAssemblerAgent(DesignExecute):
             if not city_restaurants:
                 continue
 
-            for meal_key in ("breakfast", "lunch", "dinner"):
+            for meal_key in MEAL_KEYS:
                 val = day.get(meal_key, "-").strip()
                 if not val or val == "-":
                     continue
@@ -1359,9 +1867,72 @@ class PlanAssemblerAgent(DesignExecute):
                     city_restaurants, used_restaurants
                 )
                 if rest:
-                    name = rest.get("Name", "").strip()
-                    day[meal_key] = f"{name}, {expected_city}"
-                    used_restaurants.add(name.lower())
+                    day[meal_key] = f"{rest.name}, {expected_city}"
+                    used_restaurants.add(rest.name.lower())
+
+    def _fix_wrong_city_attractions(
+        self,
+        plan: list[dict[str, Any]],
+        gathered: GatheredData,
+        task: TravelPlannerTask,
+    ) -> None:
+        """Fix attractions that reference the wrong city.
+
+        On "from X to Y" days the evaluation expects attractions in city Y.
+        Replace any attraction whose city suffix doesn't match with one from
+        the expected city.
+        """
+        used_attrs: set[str] = set()
+        for day in plan:
+            raw = day.get(ATTRACTION, NO_DATA).strip()
+            if not raw or raw == "-":
+                continue
+            for attr in raw.split(";"):
+                attr = attr.strip()
+                if attr and attr != "-" and "," in attr:
+                    used_attrs.add(attr.rsplit(",", 1)[0].strip().lower())
+
+        for day in plan:
+            current = day.get(CURRENT_CITY, "")
+            if not current or current.strip() == "-":
+                continue
+            match = re.match(r"from\s+(.+?)\s+to\s+(.+)", current, re.IGNORECASE)
+            if not match:
+                continue  # Only fix transition days
+            expected_city_raw = match.group(2).strip()
+            expected_city = self._match_gathered_city(expected_city_raw, gathered)
+            city_attractions = self._find_city_data(gathered.attractions, expected_city)
+            if not city_attractions:
+                continue
+
+            raw = day.get(ATTRACTION, NO_DATA).strip()
+            if not raw or raw == "-":
+                continue
+
+            new_parts: list[str] = []
+            changed = False
+            for attr in raw.split(";"):
+                attr = attr.strip()
+                if not attr or attr == "-":
+                    continue
+                if "," not in attr:
+                    new_parts.append(attr)
+                    continue
+                attr_city = attr.rsplit(",", 1)[1].strip()
+                if attr_city.lower() == expected_city.lower():
+                    new_parts.append(attr)
+                    continue
+                # Wrong city — pick an unused attraction from the expected city
+                replacement = self._pick_unseen_attraction(
+                    gathered, expected_city, used_attrs
+                )
+                if replacement:
+                    used_attrs.add(replacement.lower())
+                    new_parts.append(f"{replacement}, {expected_city}")
+                    changed = True
+
+            if changed:
+                day[ATTRACTION] = ";".join(new_parts) if new_parts else "-"
 
     def _deduplicate_attractions(
         self,
@@ -1375,7 +1946,7 @@ class PlanAssemblerAgent(DesignExecute):
         """
         seen: set[str] = set()
         for day in plan:
-            raw = day.get("attraction", "-").strip()
+            raw = day.get(ATTRACTION, NO_DATA).strip()
             if not raw or raw == "-":
                 continue
             city = None
@@ -1409,9 +1980,9 @@ class PlanAssemblerAgent(DesignExecute):
                         changed = True
                     # else: just drop the duplicate
             if new_parts:
-                day["attraction"] = ";".join(new_parts)
+                day[ATTRACTION] = ";".join(new_parts)
             elif raw != "-":
-                day["attraction"] = "-"
+                day[ATTRACTION] = "-"
 
     @staticmethod
     def _pick_unseen_attraction(
@@ -1423,9 +1994,8 @@ class PlanAssemblerAgent(DesignExecute):
             if city_key.lower() != city_lower:
                 continue
             for attr in attractions:
-                name = attr.get("Name", "").strip()
-                if name and name.lower() not in seen:
-                    return name
+                if attr.name and attr.name.lower() not in seen:
+                    return attr.name
         return None
 
     @staticmethod
@@ -1439,7 +2009,7 @@ class PlanAssemblerAgent(DesignExecute):
         Uses fuzzy matching against gathered data keys to resolve city names
         that may differ in casing or punctuation (e.g., Devil's Lake vs Devils Lake).
         """
-        current = day.get("current_city", "")
+        current = day.get(CURRENT_CITY, "")
         if not current or current == "-":
             return None
         # "from X to Y" → destination city Y
@@ -1459,8 +2029,8 @@ class PlanAssemblerAgent(DesignExecute):
                 if key.lower() == city_lower:
                     return key  # Return the canonical key form
                 # Fuzzy: strip punctuation for comparison
-                key_clean = key.lower().replace("'", "").replace("'", "")
-                city_clean = city_lower.replace("'", "").replace("'", "")
+                key_clean = key.lower().replace("'", "").replace("\u2019", "")
+                city_clean = city_lower.replace("'", "").replace("\u2019", "")
                 if key_clean == city_clean:
                     return key
                 # Partial match
@@ -1474,12 +2044,12 @@ class PlanAssemblerAgent(DesignExecute):
         if city in data_dict:
             return data_dict[city]
         city_lower = city.lower()
-        city_clean = city_lower.replace("'", "").replace("'", "")
+        city_clean = city_lower.replace("'", "").replace("\u2019", "")
         for k, v in data_dict.items():
             k_lower = k.lower()
             if k_lower == city_lower:
                 return v
-            k_clean = k_lower.replace("'", "").replace("'", "")
+            k_clean = k_lower.replace("'", "").replace("\u2019", "")
             if k_clean == city_clean:
                 return v
             if city_clean in k_clean or k_clean in city_clean:
@@ -1488,12 +2058,26 @@ class PlanAssemblerAgent(DesignExecute):
 
     @staticmethod
     def _pick_unused_restaurant(
-        restaurants: list[dict], used: set[str]
-    ) -> dict | None:
-        """Pick a restaurant not yet used in the plan."""
+        restaurants: list[Restaurant],
+        used: set[str],
+        preferred_cuisines: set[str] | None = None,
+    ) -> Restaurant | None:
+        """Pick a restaurant not yet used in the plan.
+
+        When *preferred_cuisines* is provided, prioritise restaurants that
+        serve at least one of the preferred cuisines before falling back to
+        any unused restaurant.
+        """
+        if preferred_cuisines:
+            pref_lower = {c.lower().strip() for c in preferred_cuisines}
+            for r in restaurants:
+                if not r.name or r.name.lower() in used:
+                    continue
+                if r.cuisine_set() & pref_lower:
+                    return r
+
         for r in restaurants:
-            name = r.get("Name", "").strip()
-            if name and name.lower() not in used:
+            if r.name and r.name.lower() not in used:
                 return r
         return restaurants[0] if restaurants else None
 
@@ -1501,8 +2085,12 @@ class PlanAssemblerAgent(DesignExecute):
         self, gathered: GatheredData, task: TravelPlannerTask
     ) -> str:
         """Build structured task description for the LLM."""
+        # Determine destination cities from gathered data
+        dest_cities = list(gathered.restaurants.keys())
+        cities_info = f" visiting {len(dest_cities)} cities: {', '.join(dest_cities)}" if len(dest_cities) > 1 else ""
+
         parts = [
-            f"Build a {task.days}-day travel plan from {task.org} to {task.dest}.",
+            f"Build a {task.days}-day travel plan from {task.org} to {task.dest}{cities_info}.",
             f"People: {task.people_number}",
             f"Dates: {task.date}",
         ]
@@ -1512,15 +2100,15 @@ class PlanAssemblerAgent(DesignExecute):
 
         # Constraints
         constraints = []
-        if task.local_constraint.get("room_type"):
-            constraints.append(f"Room type: {task.local_constraint['room_type']}")
-        if task.local_constraint.get("room_rule"):
-            constraints.append(f"Room rule: {task.local_constraint['room_rule']}")
-        if task.local_constraint.get("cuisine"):
-            constraints.append(f"Cuisine: {task.local_constraint['cuisine']}")
-        if task.local_constraint.get("transportation"):
+        if task.local_constraint.room_type:
+            constraints.append(f"Room type: {task.local_constraint.room_type}")
+        if task.local_constraint.room_rule:
+            constraints.append(f"Room rule: {task.local_constraint.room_rule}")
+        if task.local_constraint.cuisine:
+            constraints.append(f"Cuisine: {task.local_constraint.cuisine}")
+        if task.local_constraint.transportation:
             constraints.append(
-                f"Transportation: {task.local_constraint['transportation']}"
+                f"Transportation: {task.local_constraint.transportation}"
             )
         if constraints:
             parts.append("Constraints: " + ", ".join(constraints))
@@ -1532,7 +2120,7 @@ class PlanAssemblerAgent(DesignExecute):
         # Flights
         for route_key, flights in gathered.flights.items():
             var_name = _safe_var_name(f"flights_{route_key}")
-            prices = [_parse_cost(f.get("Price", "0")) for f in flights]
+            prices = [f.price for f in flights]
             parts.append(
                 f"  {var_name} = <{len(flights)} flights, "
                 f"prices ${min(prices):.0f}-${max(prices):.0f}>"
@@ -1541,10 +2129,10 @@ class PlanAssemblerAgent(DesignExecute):
         # Restaurants per city
         for city, restaurants in gathered.restaurants.items():
             var_name = _safe_var_name(f"restaurants_{city}")
-            costs = [_parse_cost(r.get("Average Cost", "0")) for r in restaurants]
+            costs = [r.average_cost for r in restaurants]
             cuisines_set: set[str] = set()
             for r in restaurants:
-                for c in r.get("Cuisines", "").split(","):
+                for c in r.cuisines.split(","):
                     c = c.strip()
                     if c:
                         cuisines_set.add(c)
@@ -1557,7 +2145,7 @@ class PlanAssemblerAgent(DesignExecute):
         # Accommodations per city
         for city, accs in gathered.accommodations.items():
             var_name = _safe_var_name(f"accommodations_{city}")
-            prices = [_parse_cost(a.get("price", "0")) for a in accs]
+            prices = [a.price for a in accs]
             parts.append(
                 f"  {var_name} = <{len(accs)} accommodations, "
                 f"prices ${min(prices):.0f}-${max(prices):.0f}/night>"
@@ -1572,8 +2160,8 @@ class PlanAssemblerAgent(DesignExecute):
         for route_key, dist in gathered.distances.items():
             var_name = _safe_var_name(f"distance_{route_key}")
             parts.append(
-                f"  {var_name} = <cost: {dist.get('cost', '?')}, "
-                f"duration: {dist.get('duration', '?')}>"
+                f"  {var_name} = <cost: {dist.cost}, "
+                f"duration: {dist.duration}>"
             )
 
         parts.append("")
@@ -1587,8 +2175,10 @@ class PlanAssemblerAgent(DesignExecute):
     def _build_execution_namespace(self) -> dict[str, Any]:
         """Inject gathered data as variables into the execution namespace.
 
-        All cost fields are pre-parsed to floats so the LLM can safely do
-        arithmetic on raw dict values without hitting str+float type errors.
+        Entity models are injected directly — their pre-parsed cost attributes
+        (price, average_cost, cost) are already floats, so the LLM can safely
+        do arithmetic. The models also support dict-like access via __getitem__
+        and get() for backward compatibility with raw field names.
 
         In addition to the canonical ``_safe_var_name`` keys (e.g.
         ``flights_chicago_nyc_on_2022_03_16``), we inject short convenience
@@ -1603,7 +2193,7 @@ class PlanAssemblerAgent(DesignExecute):
           safe-name prefix
         * ``restaurants``, ``accommodations``, ``attractions`` – point to
           the *first* city's data (covers the common single-city case)
-        * ``distances`` – list of all distance dicts
+        * ``distances`` – list of all DistanceInfo objects
         """
         ns: dict[str, Any] = {}
         if not hasattr(self, "_gathered"):
@@ -1614,12 +2204,11 @@ class PlanAssemblerAgent(DesignExecute):
         # ------------------------------------------------------------------
         # Flights  (canonical + convenience aliases)
         # ------------------------------------------------------------------
-        flight_lists: list[list[dict]] = []
+        flight_lists: list[list[Flight]] = []
         for route_key, flights in gathered.flights.items():
             var_name = _safe_var_name(f"flights_{route_key}")
-            normalised = [_normalize_costs(f, ["Price"]) for f in flights]
-            ns[var_name] = normalised
-            flight_lists.append(normalised)
+            ns[var_name] = flights
+            flight_lists.append(flights)
 
         if flight_lists:
             ns["outbound_flights"] = flight_lists[0]
@@ -1643,35 +2232,31 @@ class PlanAssemblerAgent(DesignExecute):
         # ------------------------------------------------------------------
         # Restaurants  (canonical + convenience aliases)
         # ------------------------------------------------------------------
-        first_restaurants: list[dict] | None = None
+        first_restaurants: list[Restaurant] | None = None
         for city, restaurants in gathered.restaurants.items():
-            normalised = [
-                _normalize_costs(r, ["Average Cost"]) for r in restaurants
-            ]
-            ns[_safe_var_name(f"restaurants_{city}")] = normalised
+            ns[_safe_var_name(f"restaurants_{city}")] = restaurants
             city_alias = _safe_var_name(city)
-            ns[f"{city_alias}_restaurants"] = normalised
+            ns[f"{city_alias}_restaurants"] = restaurants
             if first_restaurants is None:
-                first_restaurants = normalised
+                first_restaurants = restaurants
         ns["restaurants"] = first_restaurants or []
 
         # ------------------------------------------------------------------
         # Accommodations  (canonical + convenience aliases)
         # ------------------------------------------------------------------
-        first_accommodations: list[dict] | None = None
+        first_accommodations: list[Accommodation] | None = None
         for city, accs in gathered.accommodations.items():
-            normalised = [_normalize_costs(a, ["price"]) for a in accs]
-            ns[_safe_var_name(f"accommodations_{city}")] = normalised
+            ns[_safe_var_name(f"accommodations_{city}")] = accs
             city_alias = _safe_var_name(city)
-            ns[f"{city_alias}_accommodations"] = normalised
+            ns[f"{city_alias}_accommodations"] = accs
             if first_accommodations is None:
-                first_accommodations = normalised
+                first_accommodations = accs
         ns["accommodations"] = first_accommodations or []
 
         # ------------------------------------------------------------------
         # Attractions  (canonical + convenience aliases)
         # ------------------------------------------------------------------
-        first_attractions: list[dict] | None = None
+        first_attractions: list[Attraction] | None = None
         for city, attrs in gathered.attractions.items():
             ns[_safe_var_name(f"attractions_{city}")] = attrs
             city_alias = _safe_var_name(city)
@@ -1683,11 +2268,10 @@ class PlanAssemblerAgent(DesignExecute):
         # ------------------------------------------------------------------
         # Distances  (canonical + convenience aliases)
         # ------------------------------------------------------------------
-        distance_list: list[dict] = []
+        distance_list: list[DistanceInfo] = []
         for route_key, dist in gathered.distances.items():
-            normalised = _normalize_costs(dist, ["cost"])
-            ns[_safe_var_name(f"distance_{route_key}")] = normalised
-            distance_list.append(normalised)
+            ns[_safe_var_name(f"distance_{route_key}")] = dist
+            distance_list.append(dist)
         ns["distances"] = distance_list
 
         return ns

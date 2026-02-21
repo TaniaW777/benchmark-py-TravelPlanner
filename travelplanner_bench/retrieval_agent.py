@@ -8,7 +8,6 @@ until all necessary data for the trip has been gathered.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from opensymbolicai.blueprints import GoalSeeking
 from opensymbolicai.core import decomposition, evaluator, primitive
@@ -20,7 +19,17 @@ from opensymbolicai.models import (
     GoalSeekingConfig,
 )
 
-from travelplanner_bench.models import GatheredData, RetrievalContext, TravelPlannerTask
+from travelplanner_bench.constants import SELF_DRIVING
+from travelplanner_bench.models import (
+    Accommodation,
+    Attraction,
+    DistanceInfo,
+    Flight,
+    GatheredData,
+    Restaurant,
+    RetrievalContext,
+    TravelPlannerTask,
+)
 from travelplanner_bench.tools import (
     ReferenceDatabase,
     get_distance,
@@ -35,24 +44,7 @@ log = logging.getLogger(__name__)
 
 
 class RetrievalAgent(GoalSeeking):
-    """Gathers travel information by iteratively searching the reference database.
-
-    Searches for flights, restaurants, accommodations, attractions, distances,
-    and cities. Each iteration gathers data for one aspect of the trip.
-    Continues until all necessary data for the trip has been collected:
-    - Outbound and return flights (or distance info for driving)
-    - Restaurants, accommodations, and attractions for each destination city
-    - Inter-city distances for multi-city trips
-    - City lists for state-level destinations
-
-    RULES:
-    1. Search flights for EACH leg: origin->destination on departure date,
-       destination->origin on return date.
-    2. Search restaurants, accommodations, and attractions for EACH destination city.
-    3. For multi-city trips: search cities in the state first, then gather data
-       per city, and get inter-city distances.
-    4. Use get_distance for self-driving or taxi cost between cities.
-    """
+    """Iterative travel data gatherer using reference database search primitives."""
 
     def __init__(
         self,
@@ -63,23 +55,7 @@ class RetrievalAgent(GoalSeeking):
         super().__init__(
             llm=llm,
             name="RetrievalAgent",
-            description=(
-                "Gathers travel information by iteratively searching the reference "
-                "database. Searches for flights, restaurants, accommodations, "
-                "attractions, distances, and cities. Each iteration gathers data "
-                "for one aspect of the trip. Continues until all necessary data "
-                "has been collected.\n\n"
-                "RULES:\n"
-                "1. Search flights for EACH leg: origin->destination and back.\n"
-                "2. Search restaurants, accommodations, and attractions for EACH "
-                "destination city.\n"
-                "3. For multi-city trips (visiting_city_number > 1): search cities "
-                "in the state first, then gather data per city, and get inter-city "
-                "distances.\n"
-                "4. Use get_distance for driving/taxi cost between cities.\n"
-                "5. Check the Accumulated Knowledge to see what has already been "
-                "gathered and what is still missing."
-            ),
+            description="Iterative travel data gatherer using reference database search primitives.",
             config=GoalSeekingConfig(max_iterations=max_iterations),
         )
         self._db = db
@@ -89,7 +65,7 @@ class RetrievalAgent(GoalSeeking):
     # =========================================================================
 
     @primitive(read_only=True)
-    def search_flights(self, origin: str, destination: str, date: str) -> list[dict]:
+    def search_flights(self, origin: str, destination: str, date: str) -> list[Flight]:
         """Search for flights from origin to destination on a specific date.
 
         Args:
@@ -98,64 +74,64 @@ class RetrievalAgent(GoalSeeking):
             date: Flight date in YYYY-MM-DD format (e.g., "2022-03-22")
 
         Returns:
-            List of flights with: Flight Number, Price, DepTime, ArrTime,
-            ActualElapsedTime, FlightDate, OriginCityName, DestCityName, Distance.
+            List of Flight objects with: flight_number, price, dep_time, arr_time,
+            elapsed_time, date, origin, destination, distance.
             Empty list if no flights found.
         """
         return search_flights(self._db, origin, destination, date)
 
     @primitive(read_only=True)
-    def search_accommodations(self, city: str) -> list[dict]:
+    def search_accommodations(self, city: str) -> list[Accommodation]:
         """Search for accommodations in a city.
 
         Args:
             city: City name (e.g., "Chicago")
 
         Returns:
-            List of accommodations with: NAME, price, room type, house_rules,
-            minimum nights, maximum occupancy, review rate number, city.
+            List of Accommodation objects with: name, price, room_type, house_rules,
+            min_nights, max_occupancy, review_rate, city.
         """
         return search_accommodations(self._db, city)
 
     @primitive(read_only=True)
-    def search_restaurants(self, city: str) -> list[dict]:
+    def search_restaurants(self, city: str) -> list[Restaurant]:
         """Search for restaurants in a city.
 
         Args:
             city: City name (e.g., "Chicago")
 
         Returns:
-            List of restaurants with: Name, Average Cost, Cuisines,
-            Aggregate Rating, City.
+            List of Restaurant objects with: name, average_cost, cuisines, rating, city.
         """
         return search_restaurants(self._db, city)
 
     @primitive(read_only=True)
-    def search_attractions(self, city: str) -> list[dict]:
+    def search_attractions(self, city: str) -> list[Attraction]:
         """Search for attractions in a city.
 
         Args:
             city: City name (e.g., "Chicago")
 
         Returns:
-            List of attractions with: Name, Latitude, Longitude, Address,
-            Phone, Website, City.
+            List of Attraction objects with: name, latitude, longitude, address,
+            phone, website, city.
         """
         return search_attractions(self._db, city)
 
     @primitive(read_only=True)
     def get_distance(
-        self, origin: str, destination: str, mode: str = "self-driving"
-    ) -> dict | None:
+        self, origin: str, destination: str, mode: str = SELF_DRIVING
+    ) -> DistanceInfo | None:
         """Get distance, duration, and cost between two cities.
 
         Args:
             origin: Origin city (e.g., "Philadelphia")
             destination: Destination city (e.g., "Pittsburgh")
-            mode: Travel mode: "self-driving" or "taxi"
+            mode: Travel mode: SELF_DRIVING or "taxi"
 
         Returns:
-            Dict with duration, distance, cost, or None if not found.
+            DistanceInfo with: duration, distance, cost, mode, origin, destination.
+            Or None if not found.
         """
         return get_distance(self._db, origin, destination, mode)
 
@@ -213,7 +189,7 @@ class RetrievalAgent(GoalSeeking):
         rest_philly = self.search_restaurants("Philadelphia")
         acc_philly = self.search_accommodations("Philadelphia")
         attr_philly = self.search_attractions("Philadelphia")
-        dist = self.get_distance("Philadelphia", "Pittsburgh", "self-driving")
+        dist = self.get_distance("Philadelphia", "Pittsburgh", SELF_DRIVING)
         rest_pitt = self.search_restaurants("Pittsburgh")
         acc_pitt = self.search_accommodations("Pittsburgh")
         attr_pitt = self.search_attractions("Pittsburgh")
@@ -275,12 +251,12 @@ class RetrievalAgent(GoalSeeking):
                     gathered.attractions[city_name] = result
                     context.attractions_per_city[city_name] = len(result)
 
-            elif prim == "get_distance" and isinstance(result, dict):
+            elif prim == "get_distance" and result is not None:
                 origin = step.args.get("origin")
                 dest = step.args.get("destination")
                 mode = step.args.get("mode")
                 if origin and dest:
-                    mode_val = str(mode.resolved_value) if mode else "self-driving"
+                    mode_val = str(mode.resolved_value) if mode else SELF_DRIVING
                     key = f"{origin.resolved_value}->{dest.resolved_value} ({mode_val})"
                     gathered.distances[key] = result
                     context.has_distances = True
@@ -310,7 +286,7 @@ class RetrievalAgent(GoalSeeking):
 
         return GoalEvaluation(goal_achieved=has_travel and has_city_data)
 
-    def _extract_final_answer(self, context: GoalContext) -> Any:
+    def _extract_final_answer(self, context: GoalContext) -> GatheredData:
         assert isinstance(context, RetrievalContext)
         return context.gathered
 
@@ -359,16 +335,60 @@ class RetrievalAgent(GoalSeeking):
             goal_parts.append(
                 f"Available distance routes: {'; '.join(distance_routes)}"
             )
-        if task.local_constraint.get("transportation"):
+        if task.local_constraint.transportation:
             goal_parts.append(
-                f"Transportation constraint: {task.local_constraint['transportation']}"
+                f"Transportation constraint: {task.local_constraint.transportation}"
             )
         goal = "\n".join(goal_parts)
 
         result = self.seek(goal)
+        self._seek_result = result  # Expose for logging
+        gathered: GatheredData
         if isinstance(result.final_answer, GatheredData):
-            return result.final_answer
-        return GatheredData()
+            gathered = result.final_answer
+        else:
+            gathered = GatheredData()
+
+        # Safety net: ensure all discovered cities have restaurant/accommodation/
+        # attraction data.  The LLM may exhaust iterations before searching every
+        # city, especially on 3-city hard tasks.
+        self._backfill_city_data(gathered, city_names)
+
+        return gathered
+
+    def _backfill_city_data(
+        self, gathered: GatheredData, city_names: list[str]
+    ) -> None:
+        """Auto-fill missing per-city data for any discovered destination city."""
+        # Collect all cities we should have data for
+        all_cities: set[str] = set()
+        for cities_list in gathered.cities.values():
+            for c in cities_list:
+                all_cities.add(c.title())
+        for c in city_names:
+            all_cities.add(c.title())
+        # Also include cities already in gathered data
+        for c in list(gathered.restaurants.keys()) + list(gathered.accommodations.keys()) + list(gathered.attractions.keys()):
+            all_cities.add(c.title())
+
+        for city in all_cities:
+            if city not in gathered.restaurants:
+                results = search_restaurants(self._db, city)
+                if results:
+                    gathered.restaurants[city] = results
+                    log.info("BACKFILL: found %d restaurants for %s", len(results), city)
+
+            if city not in gathered.accommodations:
+                results = search_accommodations(self._db, city)
+                if results:
+                    gathered.accommodations[city] = results
+                    log.info("BACKFILL: found %d accommodations for %s", len(results), city)
+
+            if city not in gathered.attractions:
+                results = search_attractions(self._db, city)
+                if results:
+                    gathered.attractions[city] = results
+                    log.info("BACKFILL: found %d attractions for %s", len(results), city)
 
     def create_context(self, goal: str) -> RetrievalContext:
         ctx = RetrievalContext(goal=goal)

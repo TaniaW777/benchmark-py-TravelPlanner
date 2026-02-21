@@ -9,25 +9,17 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+
+from travelplanner_bench.constants import FLIGHT, KNOWN_COLUMN_SETS, SELF_DRIVING, TAXI
+from travelplanner_bench.models import (
+    Accommodation,
+    Attraction,
+    DistanceInfo,
+    Flight,
+    Restaurant,
+)
 
 log = logging.getLogger(__name__)
-
-
-_KNOWN_COLUMN_SETS: list[list[str]] = [
-    [
-        "Flight Number", "Price", "DepTime", "ArrTime",
-        "ActualElapsedTime", "FlightDate", "OriginCityName",
-        "DestCityName", "Distance",
-    ],
-    ["Name", "Average Cost", "Cuisines", "Aggregate Rating", "City"],
-    [
-        "NAME", "price", "room type", "house_rules",
-        "minimum nights", "maximum occupancy", "review rate number", "city",
-    ],
-    ["Name", "Latitude", "Longitude", "Address", "Phone", "Website", "City"],
-    ["duration", "distance", "cost"],
-]
 
 
 class ReferenceDatabase:
@@ -37,28 +29,28 @@ class ReferenceDatabase:
     """
 
     def __init__(self, reference_entries: list[dict[str, str]]) -> None:
-        # flights keyed by (origin_lower, dest_lower, date)
-        self.flights: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-        # accommodations keyed by city_lower
-        self.accommodations: dict[str, list[dict[str, Any]]] = {}
-        # restaurants keyed by city_lower
-        self.restaurants: dict[str, list[dict[str, Any]]] = {}
-        # attractions keyed by city_lower
-        self.attractions: dict[str, list[dict[str, Any]]] = {}
-        # distances keyed by (origin_lower, dest_lower, mode_lower)
-        self.distances: dict[tuple[str, str, str], dict[str, Any]] = {}
-        # cities keyed by state_lower
+        # Flights keyed by (origin_lower, dest_lower, date)
+        self.flights: dict[tuple[str, str, str], list[Flight]] = {}
+        # Accommodations keyed by city_lower
+        self.accommodations: dict[str, list[Accommodation]] = {}
+        # Restaurants keyed by city_lower
+        self.restaurants: dict[str, list[Restaurant]] = {}
+        # Attractions keyed by city_lower
+        self.attractions: dict[str, list[Attraction]] = {}
+        # Distances keyed by (origin_lower, dest_lower, mode_lower)
+        self.distances: dict[tuple[str, str, str], DistanceInfo] = {}
+        # Cities keyed by state_lower
         self.cities: dict[str, list[str]] = {}
 
-        # Flat lists for sandbox validation
+        # Flat sets for sandbox validation
         self.all_flight_numbers: set[str] = set()
         self.all_restaurant_names: set[str] = set()
         self.all_accommodation_names: set[str] = set()
         self.all_attraction_names: set[str] = set()
-        # Restaurant city mapping for city validation
-        self.restaurant_city: dict[str, str] = {}
-        self.accommodation_city: dict[str, str] = {}
-        self.attraction_city: dict[str, str] = {}
+        # Entity → set of cities (handles chain names in multiple cities)
+        self.restaurant_city: dict[str, set[str]] = {}
+        self.accommodation_city: dict[str, set[str]] = {}
+        self.attraction_city: dict[str, set[str]] = {}
 
         self._parse(reference_entries)
 
@@ -70,7 +62,7 @@ class ReferenceDatabase:
                 continue
 
             desc_lower = desc.lower()
-            if "flight" in desc_lower:
+            if FLIGHT in desc_lower:
                 self._parse_flights(desc, content)
             elif "restaurant" in desc_lower:
                 self._parse_restaurants(desc, content)
@@ -78,10 +70,14 @@ class ReferenceDatabase:
                 self._parse_accommodations(desc, content)
             elif "attraction" in desc_lower:
                 self._parse_attractions(desc, content)
-            elif "self-driving" in desc_lower or "taxi" in desc_lower or "driving" in desc_lower:
+            elif SELF_DRIVING in desc_lower or TAXI in desc_lower or "driving" in desc_lower:
                 self._parse_distance(desc, content)
             elif "cities in" in desc_lower:
                 self._parse_cities(desc, content)
+
+    # ------------------------------------------------------------------
+    # Content parsing
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_content(content: str) -> list[dict[str, str]]:
@@ -100,7 +96,6 @@ class ReferenceDatabase:
         rows: list[dict[str, str]] = []
         for line in lines[1:]:
             vals = [v.strip() for v in line.split("\t")]
-            # Pad or truncate to match headers
             while len(vals) < len(headers):
                 vals.append("")
             row = dict(zip(headers, vals[: len(headers)]))
@@ -117,7 +112,6 @@ class ReferenceDatabase:
             return []
         header = lines[0]
 
-        # Match against known column sets
         col_names = ReferenceDatabase._match_known_columns(header)
         if not col_names:
             # Fallback: split header by 2+ spaces
@@ -150,6 +144,10 @@ class ReferenceDatabase:
                 start = boundaries[i - 1] if i > 0 else 0
                 end = boundaries[i] if i < len(boundaries) else len(line)
                 val = line[start:min(end, len(line))].strip() if start < len(line) else ""
+                # Strip pandas row index from the first column (e.g.
+                # "251                  Flying Mango" -> "Flying Mango")
+                if i == 0 and re.match(r"^\d+\s{2,}", val):
+                    val = re.sub(r"^\d+\s{2,}", "", val)
                 row[name] = val
             rows.append(row)
         return rows
@@ -157,7 +155,7 @@ class ReferenceDatabase:
     @staticmethod
     def _match_known_columns(header: str) -> list[str] | None:
         """Match a header line against known column sets."""
-        for col_set in _KNOWN_COLUMN_SETS:
+        for col_set in KNOWN_COLUMN_SETS:
             pos = 0
             matched = True
             for col in col_set:
@@ -170,10 +168,14 @@ class ReferenceDatabase:
                 return col_set
         return None
 
+    # ------------------------------------------------------------------
+    # Entity-specific parsing
+    # ------------------------------------------------------------------
+
     def _parse_flights(self, desc: str, content: str) -> None:
         rows = self._parse_content(content)
-        # Extract origin, dest, date from description
-        # e.g. "Flight from Sarasota to Chicago on 2022-03-22"
+        flights = [Flight.from_raw(row) for row in rows]
+
         match = re.search(
             r"[Ff]light\w*\s+from\s+(.+?)\s+to\s+(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})",
             desc,
@@ -181,64 +183,63 @@ class ReferenceDatabase:
         if match:
             origin, dest, date = match.group(1).strip(), match.group(2).strip(), match.group(3)
             key = (origin.lower(), dest.lower(), date)
-            self.flights.setdefault(key, []).extend(rows)
+            self.flights.setdefault(key, []).extend(flights)
         else:
-            # Fallback: try to get from row data
-            for row in rows:
-                origin = row.get("OriginCityName", row.get("origin", "")).strip()
-                dest = row.get("DestCityName", row.get("destination", "")).strip()
-                date = row.get("FlightDate", row.get("date", "")).strip()
-                if origin and dest and date:
-                    key = (origin.lower(), dest.lower(), date)
-                    self.flights.setdefault(key, []).append(row)
+            for f in flights:
+                if f.origin and f.destination and f.date:
+                    key = (f.origin.lower(), f.destination.lower(), f.date)
+                    self.flights.setdefault(key, []).append(f)
 
-        for row in rows:
-            fn = row.get("Flight Number", "").strip()
-            if fn:
-                self.all_flight_numbers.add(fn)
+        for f in flights:
+            if f.flight_number:
+                self.all_flight_numbers.add(f.flight_number)
 
     def _parse_restaurants(self, desc: str, content: str) -> None:
         rows = self._parse_content(content)
+        restaurants = [Restaurant.from_raw(row) for row in rows]
+
         match = re.search(r"[Rr]estaurants?\s+in\s+(.+)", desc)
         city = match.group(1).strip() if match else ""
         if city:
-            self.restaurants.setdefault(city.lower(), []).extend(rows)
-        for row in rows:
-            name = row.get("Name", "").strip()
-            row_city = row.get("City", city).strip()
-            if name:
-                self.all_restaurant_names.add(name)
-                self.restaurant_city[name.lower()] = row_city
+            self.restaurants.setdefault(city.lower(), []).extend(restaurants)
+
+        for r in restaurants:
+            row_city = r.city or city
+            if r.name:
+                self.all_restaurant_names.add(r.name)
+                self.restaurant_city.setdefault(r.name.lower(), set()).add(row_city)
 
     def _parse_accommodations(self, desc: str, content: str) -> None:
         rows = self._parse_content(content)
+        accommodations = [Accommodation.from_raw(row) for row in rows]
+
         match = re.search(r"[Aa]ccommodations?\s+in\s+(.+)", desc)
         city = match.group(1).strip() if match else ""
         if city:
-            self.accommodations.setdefault(city.lower(), []).extend(rows)
-        for row in rows:
-            name = row.get("NAME", row.get("Name", "")).strip()
-            row_city = row.get("city", row.get("City", city)).strip()
-            if name:
-                self.all_accommodation_names.add(name)
-                self.accommodation_city[name.lower()] = row_city
+            self.accommodations.setdefault(city.lower(), []).extend(accommodations)
+
+        for a in accommodations:
+            row_city = a.city or city
+            if a.name:
+                self.all_accommodation_names.add(a.name)
+                self.accommodation_city.setdefault(a.name.lower(), set()).add(row_city)
 
     def _parse_attractions(self, desc: str, content: str) -> None:
         rows = self._parse_content(content)
+        attractions = [Attraction.from_raw(row) for row in rows]
+
         match = re.search(r"[Aa]ttractions?\s+in\s+(.+)", desc)
         city = match.group(1).strip() if match else ""
         if city:
-            self.attractions.setdefault(city.lower(), []).extend(rows)
-        for row in rows:
-            name = row.get("Name", "").strip()
-            row_city = row.get("City", city).strip()
-            if name:
-                self.all_attraction_names.add(name)
-                self.attraction_city[name.lower()] = row_city
+            self.attractions.setdefault(city.lower(), []).extend(attractions)
+
+        for a in attractions:
+            row_city = a.city or city
+            if a.name:
+                self.all_attraction_names.add(a.name)
+                self.attraction_city.setdefault(a.name.lower(), set()).add(row_city)
 
     def _parse_distance(self, desc: str, content: str) -> None:
-        # e.g. "Self-driving from Philadelphia to Pittsburgh"
-        # or "Taxi from Philadelphia to Pittsburgh"
         match = re.search(
             r"(self-driving|taxi|driving)\s+from\s+(.+?)\s+to\s+(.+)",
             desc,
@@ -248,36 +249,35 @@ class ReferenceDatabase:
             return
         mode = match.group(1).strip().lower()
         if mode == "driving":
-            mode = "self-driving"
+            mode = SELF_DRIVING
         origin = match.group(2).strip()
         dest = match.group(3).strip()
 
         # Try table format first (TSV or FWF)
         rows = self._parse_content(content)
         if rows:
-            row = rows[0]
+            raw = rows[0]
         else:
             # Fallback: parse comma-separated key-value format
-            # e.g. "self-driving, from X to Y, duration: 6 hours, distance: 693 km, cost: 34"
-            row = {}
+            raw: dict[str, str] = {}
             for field in ("duration", "distance", "cost"):
                 m = re.search(rf"{field}\s*:\s*([^,]+)", content, re.IGNORECASE)
                 if m:
-                    row[field] = m.group(1).strip()
+                    raw[field] = m.group(1).strip()
 
-        if row:
-            row["mode"] = mode
-            row["origin"] = origin
-            row["destination"] = dest
+        if raw:
+            raw["mode"] = mode
+            raw["origin"] = origin
+            raw["destination"] = dest
+            dist = DistanceInfo.from_raw(raw)
             key = (origin.lower(), dest.lower(), mode)
-            self.distances[key] = row
+            self.distances[key] = dist
 
     def _parse_cities(self, desc: str, content: str) -> None:
         match = re.search(r"[Cc]ities\s+in\s+(.+)", desc)
         state = match.group(1).strip() if match else ""
         if not state:
             return
-        # Content may be a simple list or TSV
         city_list = [c.strip() for c in content.strip().split("\n") if c.strip()]
         self.cities[state.lower()] = city_list
 
@@ -287,7 +287,7 @@ class ReferenceDatabase:
 # ===========================================================================
 
 
-def _fuzzy_city_key(db_dict: dict[str, Any], city: str) -> str | None:
+def _fuzzy_city_key(db_dict: dict[str, list[object]], city: str) -> str | None:
     """Find the best matching city key in a dict (case-insensitive, partial match)."""
     city_lower = city.lower().strip()
     if city_lower in db_dict:
@@ -300,7 +300,7 @@ def _fuzzy_city_key(db_dict: dict[str, Any], city: str) -> str | None:
 
 def search_flights(
     db: ReferenceDatabase, origin: str, destination: str, date: str
-) -> list[dict[str, Any]]:
+) -> list[Flight]:
     """Return flights matching origin, destination, date."""
     key = (origin.lower().strip(), destination.lower().strip(), date.strip())
     if key in db.flights:
@@ -318,7 +318,7 @@ def search_flights(
 
 def search_accommodations(
     db: ReferenceDatabase, city: str
-) -> list[dict[str, Any]]:
+) -> list[Accommodation]:
     """Return accommodations in the given city."""
     key = _fuzzy_city_key(db.accommodations, city)
     return db.accommodations.get(key, []) if key else []
@@ -326,7 +326,7 @@ def search_accommodations(
 
 def search_restaurants(
     db: ReferenceDatabase, city: str
-) -> list[dict[str, Any]]:
+) -> list[Restaurant]:
     """Return restaurants in the given city."""
     key = _fuzzy_city_key(db.restaurants, city)
     return db.restaurants.get(key, []) if key else []
@@ -334,15 +334,15 @@ def search_restaurants(
 
 def search_attractions(
     db: ReferenceDatabase, city: str
-) -> list[dict[str, Any]]:
+) -> list[Attraction]:
     """Return attractions in the given city."""
     key = _fuzzy_city_key(db.attractions, city)
     return db.attractions.get(key, []) if key else []
 
 
 def get_distance(
-    db: ReferenceDatabase, origin: str, destination: str, mode: str = "self-driving"
-) -> dict[str, Any] | None:
+    db: ReferenceDatabase, origin: str, destination: str, mode: str = SELF_DRIVING
+) -> DistanceInfo | None:
     """Return distance/duration/cost between two cities."""
     key = (origin.lower().strip(), destination.lower().strip(), mode.lower().strip())
     if key in db.distances:
@@ -373,9 +373,6 @@ def search_cities(
         if key in skey or skey in key:
             return cities
     # Fallback: infer destination cities from available data.
-    # Each task's reference data only contains entries for destination cities,
-    # so the union of city keys across restaurants/accommodations/attractions
-    # gives exactly the cities the agent needs to visit.
     all_cities: set[str] = set()
     all_cities.update(db.restaurants.keys())
     all_cities.update(db.accommodations.keys())

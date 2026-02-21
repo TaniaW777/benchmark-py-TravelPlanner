@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from travelplanner_bench.models import IterationLog, TravelPlannerResult, TravelPlannerTask
+
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 
 log = logging.getLogger(__name__)
@@ -27,8 +29,8 @@ def _create_run_dir(model: str) -> Path:
 
 
 def _run_single_task(
-    task: Any,
-    llm_config: Any,
+    task: TravelPlannerTask,
+    llm_config: Any,  # LLMConfig - keep Any to avoid opensymbolicai import at module level
     max_iterations: int,
 ) -> dict[str, Any]:
     """Run a single TravelPlanner task with the OpenSymbolicAI agent."""
@@ -50,42 +52,21 @@ def _run_single_task(
         eval_result.model = str(llm_config.model) if hasattr(llm_config, "model") else ""
 
         result = eval_result.model_dump()
-        result["iteration_logs"] = iteration_logs
+        result["iteration_logs"] = [il.model_dump() for il in iteration_logs]
         return result
     except Exception as e:
         elapsed = time.perf_counter() - start
         log.exception("Task %s failed: %s", task.task_id, e)
-        return {
-            "task_id": task.task_id,
-            "query": task.query,
-            "level": task.level,
-            "days": task.days,
-            "plan": None,
-            "plan_delivered": False,
-            "within_sandbox": False,
-            "complete_info": False,
-            "within_current_city": False,
-            "reasonable_city_route": False,
-            "diverse_restaurants": False,
-            "diverse_attractions": False,
-            "non_conflicting_transport": False,
-            "valid_accommodation": False,
-            "budget_ok": None,
-            "room_rule_ok": None,
-            "room_type_ok": None,
-            "cuisine_ok": None,
-            "transportation_ok": None,
-            "commonsense_micro": 0.0,
-            "commonsense_macro": False,
-            "hard_micro": 0.0,
-            "hard_macro": False,
-            "final_pass": False,
-            "model": "",
-            "framework": "opensymbolicai",
-            "iterations": 0,
-            "wall_time_seconds": elapsed,
-            "error": str(e),
-        }
+        result = TravelPlannerResult(
+            task_id=task.task_id,
+            query=task.query,
+            level=task.level,
+            days=task.days,
+            wall_time_seconds=elapsed,
+            error=str(e),
+        ).model_dump()
+        result["iteration_logs"] = []
+        return result
 
 
 def _write_task_log(run_dir: Path, index: int, result: dict[str, Any]) -> None:
@@ -142,10 +123,36 @@ def _write_task_log(run_dir: Path, index: int, result: dict[str, Any]) -> None:
 
     # Full iteration logs with LLM inputs/outputs and tool calls
     iteration_logs = result.get("iteration_logs", [])
+
+    # Aggregate token/time totals per phase
+    phase_totals: dict[str, dict[str, float]] = {}
+    for il in iteration_logs:
+        phase = il.get("phase", "orchestrator")
+        if phase not in phase_totals:
+            phase_totals[phase] = {"input_tokens": 0, "output_tokens": 0, "time": 0.0, "llm_calls": 0}
+        phase_totals[phase]["input_tokens"] += il.get("input_tokens", 0)
+        phase_totals[phase]["output_tokens"] += il.get("output_tokens", 0)
+        phase_totals[phase]["time"] += il.get("time_seconds", 0.0)
+        phase_totals[phase]["llm_calls"] += 1
+
+    if phase_totals:
+        lines.extend(["## Token & Time Summary", ""])
+        for phase, totals in phase_totals.items():
+            lines.append(
+                f"- **{phase}**: {totals['llm_calls']} LLM calls, "
+                f"{totals['input_tokens']} in / {totals['output_tokens']} out tokens, "
+                f"{totals['time']:.1f}s"
+            )
+        lines.append("")
+
     for iter_log in iteration_logs:
-        iter_num = iter_log.get("iteration", "?")
+        phase = iter_log.get("phase", "orchestrator")
+        iter_num = iter_log.get("iteration", iter_log.get("attempt", "?"))
+        phase_label = phase.replace("_", " ").title()
+        header = f"## {phase_label} — Iteration {iter_num}"
+
         lines.extend([
-            f"## Iteration {iter_num}",
+            header,
             "",
             f"**Model**: {iter_log.get('model', '')}",
             f"**Tokens**: {iter_log.get('input_tokens', 0)} in / {iter_log.get('output_tokens', 0)} out",
@@ -191,7 +198,6 @@ def _compute_summary(
 ) -> dict[str, Any]:
     """Compute aggregate metrics from results."""
     from travelplanner_bench.evaluation import compute_aggregate_metrics
-    from travelplanner_bench.models import TravelPlannerResult
 
     # Reconstruct TravelPlannerResult objects
     result_objects = []
@@ -315,18 +321,13 @@ def run_benchmark(
                 try:
                     result = future.result()
                 except Exception as e:
-                    result = {
-                        "task_id": task.task_id,
-                        "query": task.query,
-                        "level": task.level,
-                        "days": task.days,
-                        "plan_delivered": False,
-                        "final_pass": False,
-                        "commonsense_micro": 0.0,
-                        "hard_micro": 0.0,
-                        "wall_time_seconds": 0.0,
-                        "error": str(e),
-                    }
+                    result = TravelPlannerResult(
+                        task_id=task.task_id,
+                        query=task.query,
+                        level=task.level,
+                        days=task.days,
+                        error=str(e),
+                    ).model_dump()
                 indexed_results[idx] = result
                 _write_task_log(run_dir, idx, result)
                 status = "PASS" if result.get("final_pass") else "FAIL"
@@ -387,29 +388,26 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run on all validation tasks
-  uv run travelplanner-bench
+  # Run 5 easy validation tasks with GPT-4o
+  uv run travelplanner-bench --model gpt-4o --provider openai --level easy -n 5
 
-  # Run on easy tasks only
-  uv run travelplanner-bench --level easy
-
-  # Run 5 tasks with a specific model
-  uv run travelplanner-bench --num 5 --model gpt-4o --provider openai
+  # Run all validation tasks with Fireworks
+  uv run travelplanner-bench --model gpt-oss-120b --provider fireworks
 
   # Run on training set
-  uv run travelplanner-bench --split train --num 10
+  uv run travelplanner-bench --model gpt-4o --provider openai --split train --num 10
         """,
     )
     parser.add_argument(
         "--model",
-        default="accounts/fireworks/models/gpt-oss-120b",
-        help="Model name/ID (default: gpt-oss-120b on Fireworks)",
+        required=True,
+        help="Model name/ID (e.g., gpt-4o, gpt-oss-120b, claude-sonnet-4-20250514)",
     )
     parser.add_argument(
         "--provider",
         choices=["ollama", "openai", "anthropic", "fireworks", "groq"],
-        default="fireworks",
-        help="LLM provider (default: fireworks)",
+        required=True,
+        help="LLM provider",
     )
     parser.add_argument(
         "--split",

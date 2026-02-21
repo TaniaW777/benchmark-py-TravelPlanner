@@ -2,6 +2,7 @@
 name = "benchmark-py-travelplanner"
 version = "0.1.0"
 description = "TravelPlanner Benchmark: Multi-constraint travel planning agent evaluation"
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,6 +10,7 @@ dependencies = [
     "datasets>=2.0.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
+    "litellm>=1.81.13",
 ]
 
 [project.optional-dependencies]
@@ -16,12 +18,22 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
+langchain = [
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langgraph>=0.2.0",
+]
+crewai = [
+    "crewai>=0.80.0",
+]
+comparison = [
+    "benchmark-py-travelplanner[langchain,crewai]",
+]
 
 [project.scripts]
 travelplanner-bench = "travelplanner_bench.runner:main"
-
-[tool.uv.sources]
-opensymbolicai-core = { path = "../core-py", editable = true }
+travelplanner-compare = "travelplanner_bench.comparison_runner:main"
 
 [build-system]
 requires = ["hatchling"]

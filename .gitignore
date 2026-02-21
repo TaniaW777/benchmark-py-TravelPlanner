@@ -21,5 +21,8 @@ logs/
 # OS
 .DS_Store
 
+# Test cache
+.pytest_cache/
+
 # Claude
 .claude/

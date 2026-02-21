@@ -2,6 +2,7 @@
 
 from travelplanner_bench.models import (
     DayPlan,
+    LocalConstraint,
     TravelPlanContext,
     TravelPlannerResult,
     TravelPlannerTask,
@@ -37,7 +38,7 @@ def test_task_defaults():
     assert task.level == "easy"
     assert task.people_number == 1
     assert task.budget == 0
-    assert task.local_constraint == {}
+    assert task.local_constraint == LocalConstraint()
     assert task.annotated_plan is None
 
 

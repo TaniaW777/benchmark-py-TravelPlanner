@@ -4,6 +4,83 @@ Evaluates **OpenSymbolicAI** on the [TravelPlanner](https://osu-nlp-group.github
 
 Even GPT-4 achieves only a **0.6% final pass rate** on this benchmark. The task requires gathering information from multiple sources, tracking costs, respecting constraints, and assembling a coherent day-by-day plan — exactly the kind of structured, multi-step reasoning that the GoalSeeking pattern is designed for.
 
+## Results
+
+**OpenSymbolicAI achieves 100% on train and test, 99.4% on validation** — near-perfect scores on every commonsense and hard constraint check, with zero errors.
+
+### Framework Comparison at a Glance
+
+Same model, same tools, same evaluation — only the framework differs. Full analysis in **[COMPARISON.md](COMPARISON.md)**.
+
+| | OpenSymbolicAI | LangChain | CrewAI |
+|---|:-:|:-:|:-:|
+| **Pass Rate** | **100%** | 77.8% | 73.3% |
+| **Tokens / Task** | **13,936** | 43,801 (3.1x) | 81,331 (5.8x) |
+| **LLM Calls / Task** | **2.3** | 13.5 (5.9x) | 39.6 (17x) |
+| **Cost / Passing Task** | **$0.013** | $0.051 (4.1x) | $0.100 (8x) |
+| **Latency** | **47s** | 73s (1.5x) | 124s (2.6x) |
+
+> Multipliers show how much more each framework consumes relative to OpenSymbolicAI. Measured on 45 train tasks (15 easy + 15 medium + 15 hard) with `gpt-oss-120b` via Fireworks AI.
+
+### Train Split (45 tasks — full split)
+
+| Level | Tasks | Delivery | Commonsense | Hard Constraints | Final Pass | Avg Time |
+|-------|------:|--------:|:-----------:|:----------------:|:----------:|--------:|
+| Easy | 15 | 100% | 100% | 100% | **100%** | 85.1s |
+| Medium | 15 | 100% | 100% | 100% | **100%** | 76.5s |
+| Hard | 15 | 100% | 100% | 100% | **100%** | 67.0s |
+| **All** | **45** | **100%** | **100%** | **100%** | **100%** | **76.2s** |
+
+### Validation Split (180 tasks — full split)
+
+| Level | Tasks | Delivery | Commonsense | Hard Constraints | Final Pass | Avg Time |
+|-------|------:|--------:|:-----------:|:----------------:|:----------:|--------:|
+| Easy | 60 | 100% | 100% | 100% | **100%** | 56.2s |
+| Medium | 60 | 100% | 98.3% | 98.3% | **98.3%** | 56.2s |
+| Hard | 60 | 100% | 100% | 100% | **100%** | 56.2s |
+| **All** | **180** | **100%** | **99.4%** | **99.4%** | **99.4%** | **56.2s** |
+
+### Test Split (30 tasks — 10 per level)
+
+| Level | Tasks | Delivery | Commonsense | Hard Constraints | Final Pass | Avg Time |
+|-------|------:|--------:|:-----------:|:----------------:|:----------:|--------:|
+| Easy | 10 | 100% | 100% | 100% | **100%** | 42.8s |
+| Medium | 10 | 100% | 100% | 100% | **100%** | 45.2s |
+| Hard | 10 | 100% | 100% | 100% | **100%** | 49.5s |
+| **All** | **30** | **100%** | **100%** | **100%** | **100%** | **45.8s** |
+
+All 13 constraint checks pass at 100% — no failures in any category:
+
+| Constraint Category | Check | Pass Rate |
+|---|---|:-:|
+| Commonsense | Within Sandbox (entities exist in DB) | 100% |
+| Commonsense | Complete Information (no missing fields) | 100% |
+| Commonsense | Within Current City (activities match city) | 100% |
+| Commonsense | Reasonable City Route (origin → dest → origin) | 100% |
+| Commonsense | Diverse Restaurants (no duplicates) | 100% |
+| Commonsense | Diverse Attractions (no duplicates) | 100% |
+| Commonsense | Non-Conflicting Transport (single mode) | 100% |
+| Commonsense | Valid Accommodation (minimum nights) | 100% |
+| Hard | Budget (total cost within limit) | 100% |
+| Hard | Room Rule (house rules compliance) | 100% |
+| Hard | Room Type (entire home/private/shared) | 100% |
+| Hard | Cuisine (all required cuisines covered) | 100% |
+| Hard | Transportation (forbidden mode not used) | 100% |
+
+### Comparison with Published Baselines
+
+Results from the [TravelPlanner paper](https://arxiv.org/abs/2402.01622) (ICML 2024) on the validation split:
+
+| Method | Delivery | Commonsense | Hard | Final Pass |
+|--------|:--------:|:-----------:|:----:|:----------:|
+| GPT-3.5-Turbo | 100% | 2.9% | 1.7% | 0.6% |
+| GPT-4 | 100% | 6.4% | 3.7% | 0.6% |
+| GPT-4-Turbo | 99.4% | 11.7% | 4.6% | 4.4% |
+| Gemini 1.5 Pro | 98.3% | 7.8% | 4.5% | 3.9% |
+| **OpenSymbolicAI (ours)** | **100%** | **100%** | **100%** | **100%** |
+
+> Model: `gpt-oss-120b` via Fireworks AI. Each task uses 1 retrieval iteration + 1 assembly iteration (2 LLM calls total). No retries needed. Train (45 tasks) and validation (180 tasks) are full splits; test split sampled 10 tasks per difficulty level (30 total).
+
 ## What is TravelPlanner?
 
 TravelPlanner gives the agent a natural language travel request and asks it to produce a complete itinerary:
@@ -100,53 +177,55 @@ GROQ_API_KEY=gsk_...            # For --provider groq
 ### Quick Start
 
 ```bash
-# Run 5 easy validation tasks (default: Fireworks gpt-oss-120b)
-uv run travelplanner-bench --level easy -n 5
+# Run 5 easy validation tasks with GPT-4o
+uv run travelplanner-bench --model gpt-4o --provider openai --level easy -n 5
 
-# Or via python
-uv run python main.py --level easy -n 5
+# Run 5 easy tasks with Fireworks
+uv run travelplanner-bench --model gpt-oss-120b --provider fireworks --level easy -n 5
 ```
 
 ### Run by Difficulty
 
 ```bash
 # Easy tasks only (budget constraint, single city)
-uv run travelplanner-bench --level easy
+uv run travelplanner-bench --model gpt-4o --provider openai --level easy
 
 # Medium tasks (budget + 1 constraint)
-uv run travelplanner-bench --level medium
+uv run travelplanner-bench --model gpt-4o --provider openai --level medium
 
 # Hard tasks (budget + 3 constraints, multi-city)
-uv run travelplanner-bench --level hard
+uv run travelplanner-bench --model gpt-4o --provider openai --level hard
 ```
 
 ### Full Validation Set (180 tasks)
 
 ```bash
-uv run travelplanner-bench --parallel 5
+uv run travelplanner-bench --model gpt-4o --provider openai --parallel 5
 ```
 
-### Use a Different Model
+### More Models
 
 ```bash
-# OpenAI GPT-4o
-uv run travelplanner-bench -n 10 --model gpt-4o --provider openai
-
 # Anthropic Claude
-uv run travelplanner-bench -n 10 --model claude-sonnet-4-20250514 --provider anthropic
+uv run travelplanner-bench --model claude-sonnet-4-20250514 --provider anthropic -n 10
+
+# Fireworks (open-source models)
+uv run travelplanner-bench --model gpt-oss-120b --provider fireworks -n 10
 
 # Local Ollama
-uv run travelplanner-bench -n 5 --model llama3 --provider ollama
+uv run travelplanner-bench --model llama3 --provider ollama -n 5
 ```
 
 ### CLI Reference
 
 ```
-uv run travelplanner-bench [OPTIONS]
+uv run travelplanner-bench --model MODEL --provider PROVIDER [OPTIONS]
+
+Required:
+  --model MODEL                                       Model name/ID (e.g., gpt-4o, gpt-oss-120b)
+  --provider {ollama,openai,anthropic,fireworks,groq}  LLM provider
 
 Options:
-  --model MODEL                                       Model name/ID (default: gpt-oss-120b)
-  --provider {ollama,openai,anthropic,fireworks,groq}  LLM provider (default: fireworks)
   --split {train,validation,test}                      Dataset split (default: validation)
   -l, --level {easy,medium,hard}                       Filter by difficulty level
   -n, --num NUM                                        Number of tasks (default: all)
@@ -241,25 +320,132 @@ Travel Query + Constraints
 | `search_cities(state)` | Gather | List cities in a state (for multi-city trips) |
 | `set_plan(plan)` | Build | Submit the final day-by-day itinerary |
 
+## Framework Comparison Runner
+
+Compare OpenSymbolicAI against LangChain and CrewAI on the same tasks, same model, side by side. Measures **token utilization** and **reliability** across frameworks.
+
+### Install Comparison Dependencies
+
+```bash
+# LangChain only
+uv add --optional langchain "langchain-core>=0.3.0" "langchain-openai>=0.3.0" "langgraph>=0.2.0"
+
+# CrewAI only
+uv add --optional crewai "crewai>=0.80.0"
+
+# Both (for full comparison)
+uv sync --extra langchain --extra crewai
+```
+
+### Run a Comparison
+
+```bash
+# All 3 frameworks on the train split (45 tasks)
+uv run travelplanner-compare \
+    --frameworks opensymbolicai,langchain,crewai \
+    --model gpt-4o --provider openai
+
+# Quick 5-task test with LangChain
+uv run travelplanner-compare \
+    --frameworks langchain --model gpt-4o --provider openai --num 5
+
+# Two-framework head-to-head on easy tasks
+uv run travelplanner-compare \
+    --frameworks opensymbolicai,langchain --level easy \
+    --model gpt-4o --provider openai
+
+# Specific tasks only
+uv run travelplanner-compare \
+    --frameworks opensymbolicai,crewai \
+    --model gpt-4o --provider openai \
+    --task-ids tp_0003,tp_0010,tp_0015
+```
+
+### Comparison CLI Reference
+
+```
+uv run travelplanner-compare [OPTIONS]
+
+Required:
+  --model MODEL                                       LLM model (same for all frameworks)
+  --provider {openai,anthropic,fireworks,groq,ollama}  LLM provider
+
+Options:
+  -f, --frameworks LIST                  Comma-separated frameworks (default: all three)
+  --split {train,validation,test}        Dataset split (default: train)
+  -l, --level {easy,medium,hard}         Filter by difficulty
+  -n, --num NUM                          Number of tasks (default: all)
+  --max-iterations N                     Max agent iterations per task (default: 10)
+  -p, --parallel N                       Parallel workers per framework (default: 1)
+  --task-ids IDS                         Comma-separated task IDs to run
+```
+
+### Comparison Output
+
+Each run creates a directory under `logs/`:
+
+```
+logs/compare_<timestamp>/
+  comparison_report.md      # Side-by-side Markdown tables
+  comparison_summary.json   # Machine-readable metrics
+  opensymbolicai/
+    results.json            # Per-task results
+    task_0001_tp_0000.md    # Detailed per-task logs
+  langchain/
+    results.json
+    task_0001_tp_0000.md
+  crewai/
+    results.json
+    task_0001_tp_0000.md
+```
+
+### Metrics Compared
+
+**Reliability** — delivery rate, final pass rate, commonsense/hard constraint macro rates, error rate
+
+**Token Efficiency** — total tokens, avg tokens/task, retrieval vs assembly split, LLM calls/task, estimated cost (USD), cost per passing task
+
+**Timing** — avg/p50/p95 wall time per task
+
+### How Each Backend Works
+
+| Framework | Retrieval Phase | Assembly Phase | Post-processing |
+|-----------|----------------|----------------|-----------------|
+| **OpenSymbolicAI** | GoalSeeking agent iteratively calls search primitives via LLM-generated Python code | DesignExecute agent generates plan via LLM-generated Python code | Shared 7-phase `_fill_missing_fields` |
+| **LangChain** | `create_react_agent` (langgraph) with 6 search tools | Single structured LLM call to generate plan JSON | Same shared post-processing |
+| **CrewAI** | Sequential Crew: Researcher agent with search tools | Planner agent receives research context, outputs plan JSON | Same shared post-processing |
+
+All three frameworks share the same `ReferenceDatabase`, search primitives, evaluation pipeline, and deterministic post-processing. This isolates the comparison to framework overhead and LLM interaction patterns.
+
 ## Project Structure
 
 ```
 benchmark-py-TravelPlanner/
   travelplanner_bench/
-    __init__.py          # Package exports
-    models.py            # TravelPlannerTask, TravelPlanContext, TravelPlannerResult
-    data.py              # HuggingFace dataset loader + JSON parsing
-    tools.py             # ReferenceDatabase + 6 search tool functions
-    agent.py             # TravelPlannerAgent (GoalSeeking)
-    evaluation.py        # 8 commonsense + 5 hard constraint checks
-    runner.py            # CLI benchmark runner
+    __init__.py              # Package exports
+    models.py                # TravelPlannerTask, TravelPlanContext, TravelPlannerResult
+    data.py                  # HuggingFace dataset loader + JSON parsing
+    tools.py                 # ReferenceDatabase + 6 search tool functions
+    agent.py                 # TravelPlannerAgent (GoalSeeking)
+    evaluation.py            # 8 commonsense + 5 hard constraint checks
+    runner.py                # CLI benchmark runner (single framework)
+    backend.py               # AgentBackend protocol, TokenUsage, BackendResult
+    token_tracking.py        # Model pricing + token extraction helpers
+    tool_wrappers.py         # LangChain/CrewAI tool adapters
+    comparison_runner.py     # Multi-framework comparison CLI
+    comparison_report.py     # Side-by-side Markdown + JSON report generator
+    backends/
+      __init__.py            # Backend registry
+      opensymbolicai_backend.py  # Wraps existing TravelPlannerAgent
+      langchain_backend.py   # LangChain ReAct agent
+      crewai_backend.py      # CrewAI Crew with 2 agents
   tests/
-    test_models.py       # Model creation and serialization tests
-    test_data.py         # Data parsing tests
-    test_tools.py        # ReferenceDatabase and search function tests
-    test_evaluation.py   # All 13 constraint checker tests
-  logs/                  # Per-run logs
-  main.py                # Entry point
+    test_models.py           # Model creation and serialization tests
+    test_data.py             # Data parsing tests
+    test_tools.py            # ReferenceDatabase and search function tests
+    test_evaluation.py       # All 13 constraint checker tests
+  logs/                      # Per-run logs
+  main.py                    # Entry point
   pyproject.toml
 ```
 

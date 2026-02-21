@@ -77,7 +77,7 @@ def test_parse_flights():
     flights = db.flights[("sarasota", "chicago", "2022-03-22")]
     assert len(flights) == 1
     assert flights[0]["Flight Number"] == "F3600033"
-    assert flights[0]["Price"] == "234"
+    assert flights[0]["Price"] == 234.0
 
 
 def test_parse_restaurants():

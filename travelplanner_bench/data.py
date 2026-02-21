@@ -12,6 +12,8 @@ import logging
 import re
 from typing import Any
 
+from travelplanner_bench.models import LocalConstraint, TravelPlannerTask
+
 log = logging.getLogger(__name__)
 
 
@@ -148,7 +150,7 @@ def load_travelplanner(
     num: int | None = None,
     shuffle: bool = False,
     seed: int = 42,
-) -> list:
+) -> list[TravelPlannerTask]:
     """Load TravelPlanner tasks from HuggingFace.
 
     Args:
@@ -163,8 +165,6 @@ def load_travelplanner(
     """
     from datasets import load_dataset
 
-    from travelplanner_bench.models import TravelPlannerTask
-
     ds = load_dataset("osunlp/TravelPlanner", split, split=split)
 
     if shuffle:
@@ -177,7 +177,7 @@ def load_travelplanner(
             continue
 
         ref_info = parse_reference_information(row.get("reference_information", []))
-        local_constraint = parse_local_constraint(row.get("local_constraint", {}))
+        raw_constraint = parse_local_constraint(row.get("local_constraint", {}))
         annotated_plan = parse_annotated_plan(row.get("annotated_plan"))
         date = parse_date_field(row.get("date", []))
 
@@ -199,7 +199,7 @@ def load_travelplanner(
             level=task_level,
             visiting_city_number=row.get("visiting_city_number", 1),
             people_number=people_number,
-            local_constraint=local_constraint,
+            local_constraint=LocalConstraint.from_raw(raw_constraint),
             budget=budget,
             reference_information=ref_info,
             annotated_plan=annotated_plan,
@@ -213,7 +213,7 @@ def load_travelplanner(
     return tasks
 
 
-def get_level_counts(tasks: list) -> dict[str, int]:
+def get_level_counts(tasks: list[TravelPlannerTask]) -> dict[str, int]:
     """Count tasks per difficulty level."""
     counts: dict[str, int] = {}
     for task in tasks:
