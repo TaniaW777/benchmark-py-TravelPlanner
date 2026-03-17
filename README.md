@@ -1,16 +1,16 @@
-<h1 align="center">🌍 TravelPlanner Benchmark</h1>
+<h1 align="center"> TravelPlanner Benchmark</h1>
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
 </p>
 
-## 📖 Overview
+##  Overview
 
 Standardized evaluation framework for agentic travel planning. This benchmark measures the ability of LLM agents to handle complex constraints, tool usage, and reasoning efficiency across various frameworks.
 
 ---
 
-## 🚀 Quickstart
+##  Quickstart
 
 Run your first benchmark in under 5 minutes:
 ```bash
@@ -25,7 +25,7 @@ uv run python run_benchmark.py --limit 5
 
 ---
 
-## ⚙️ Full Setup
+##  Full Setup
 
 To run the full benchmark suite, ensure your environment is configured:
 
@@ -37,7 +37,7 @@ To run the full benchmark suite, ensure your environment is configured:
 
 ---
 
-## 📊 Results Summary
+##  Results Summary
 
 Current baseline results for supported providers:
 
@@ -47,7 +47,7 @@ Current baseline results for supported providers:
 
 ---
 
-## 🤝 Contributing
+##  Contributing
 
 This benchmark is aligned with the OpenSymbolicAI standards. For detailed research methodology, data generation scripts, and full evaluation logs, please refer to the original documentation below.
 
