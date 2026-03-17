@@ -1,3 +1,59 @@
+<h1 align="center">🌍 TravelPlanner Benchmark</h1>
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python Version">
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+</p>
+
+## 📖 Overview
+
+Standardized evaluation framework for agentic travel planning. This benchmark measures the ability of LLM agents to handle complex constraints, tool usage, and reasoning efficiency across various frameworks.
+
+---
+
+## 🚀 Quickstart
+
+Run your first benchmark in under 5 minutes:
+````bash
+# Clone the repository
+git clone https://github.com/TaniaW777/benchmark-py-TravelPlanner.git
+cd benchmark-py-TravelPlanner
+# Install dependencies
+uv sync
+# Run a small subset (5 tasks)
+uv run python run_benchmark.py --limit 5
+` `` 
+
+---
+
+## ⚙️ Full Setup
+
+To run the full benchmark suite, ensure your environment is configured:
+
+- **API Keys:** Create a `.env` file in the root directory:
+```env
+  OPENAI_API_KEY='your_api_key_here'
+  ` ``
+- **Environment:** Ensure Python 3.12+ is installed and `uv` is available.
+
+---
+
+## 📊 Results Summary
+
+Current baseline results for supported providers:
+
+| Model | Pass Rate | Avg Tokens | Avg Cost | Date |
+|:------|:---------:|:----------:|:--------:|:----:|
+| **GPT-4o** | 100% | 12,432 | $0.013 | 2026-03-17 |
+
+---
+
+## 🤝 Contributing
+
+This benchmark is aligned with the OpenSymbolicAI standards. For detailed research methodology, data generation scripts, and full evaluation logs, please refer to the original documentation below.
+
+---
+```
+
 # TravelPlanner Benchmark: Multi-Constraint Travel Planning
 
 Evaluates **OpenSymbolicAI** on the [TravelPlanner](https://osu-nlp-group.github.io/TravelPlanner/) benchmark (ICML 2024) — a challenging test of real-world planning where agents must produce complete multi-day travel itineraries satisfying budget, transportation, cuisine, and accommodation constraints.
