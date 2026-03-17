@@ -13,7 +13,7 @@ Standardized evaluation framework for agentic travel planning. This benchmark me
 ## 🚀 Quickstart
 
 Run your first benchmark in under 5 minutes:
-````bash
+```bash
 # Clone the repository
 git clone https://github.com/TaniaW777/benchmark-py-TravelPlanner.git
 cd benchmark-py-TravelPlanner
@@ -21,7 +21,7 @@ cd benchmark-py-TravelPlanner
 uv sync
 # Run a small subset (5 tasks)
 uv run python run_benchmark.py --limit 5
-` `` 
+``` 
 
 ---
 
@@ -32,7 +32,7 @@ To run the full benchmark suite, ensure your environment is configured:
 - **API Keys:** Create a `.env` file in the root directory:
 ```env
   OPENAI_API_KEY='your_api_key_here'
-  ` ``
+  ```
 - **Environment:** Ensure Python 3.12+ is installed and `uv` is available.
 
 ---
@@ -52,7 +52,8 @@ Current baseline results for supported providers:
 This benchmark is aligned with the OpenSymbolicAI standards. For detailed research methodology, data generation scripts, and full evaluation logs, please refer to the original documentation below.
 
 ---
-```
+
+
 
 # TravelPlanner Benchmark: Multi-Constraint Travel Planning
 
